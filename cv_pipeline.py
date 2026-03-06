@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from collections import defaultdict, deque
 
 import cv2
@@ -287,3 +287,262 @@ class BlobTracker:
         self.missed = new_missed
 
         return [(box, tid) for tid, box in assigned.items()]
+
+
+# ----------------------------
+# YOLO-World + BoT-SORT + Kalman prediction
+# ----------------------------
+
+
+@dataclass
+class YoloWorldConfig:
+    model_name: str = "yolov8s-world.pt"
+    conf_threshold: float = 0.25
+    iou_threshold: float = 0.50
+    tracker_yaml: str = "botsort.yaml"
+    classes_en: Optional[List[str]] = None
+
+
+@dataclass
+class TrajectoryConfig:
+    horizon_frames: int = 10
+    dt: float = 1.0
+    process_noise: float = 1.0
+    measurement_noise: float = 5.0
+    initial_covariance: float = 10.0
+    max_missed_frames: int = 30
+
+
+@dataclass
+class TrackedObject:
+    track_id: int
+    bbox_xyxy: Tuple[int, int, int, int]
+    confidence: float
+    class_name: str
+    class_id: int
+    centroid_xy: Tuple[float, float]
+
+
+@dataclass
+class TrajectoryPrediction:
+    track_id: int
+    future_points: List[Tuple[float, float]]
+    future_bboxes: List[Tuple[int, int, int, int]]
+    state_xyvxvy: Tuple[float, float, float, float]
+
+
+class TrajectoryPredictor:
+    """Constant-velocity Kalman predictor with state [x, y, vx, vy]^T."""
+
+    def __init__(self, cfg: TrajectoryConfig):
+        self.cfg = cfg
+        self._state: Dict[int, np.ndarray] = {}
+        self._cov: Dict[int, np.ndarray] = {}
+        self._missed: Dict[int, int] = defaultdict(int)
+        self._size_wh: Dict[int, Tuple[float, float]] = {}
+
+        dt = float(self.cfg.dt)
+        self._A = np.array(
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        self._H = np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        q = float(self.cfg.process_noise)
+        r = float(self.cfg.measurement_noise)
+        p0 = float(self.cfg.initial_covariance)
+        self._Q = np.eye(4, dtype=np.float32) * q
+        self._R = np.eye(2, dtype=np.float32) * r
+        self._P0 = np.eye(4, dtype=np.float32) * p0
+        self._I = np.eye(4, dtype=np.float32)
+
+    def _predict_only(self, x: np.ndarray, p: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        x_pred = self._A @ x
+        p_pred = self._A @ p @ self._A.T + self._Q
+        return x_pred, p_pred
+
+    def _update(self, track_id: int, center_xy: Tuple[float, float], bbox_xyxy: Tuple[int, int, int, int]) -> None:
+        z = np.array([[float(center_xy[0])], [float(center_xy[1])]], dtype=np.float32)
+
+        if track_id not in self._state:
+            x0 = np.array([[z[0, 0]], [z[1, 0]], [0.0], [0.0]], dtype=np.float32)
+            self._state[track_id] = x0
+            self._cov[track_id] = self._P0.copy()
+            self._missed[track_id] = 0
+        else:
+            self._missed[track_id] = 0
+
+        x = self._state[track_id]
+        p = self._cov[track_id]
+        x_pred, p_pred = self._predict_only(x, p)
+
+        y = z - (self._H @ x_pred)
+        s = self._H @ p_pred @ self._H.T + self._R
+        k = p_pred @ self._H.T @ np.linalg.inv(s)
+        x_new = x_pred + (k @ y)
+        p_new = (self._I - (k @ self._H)) @ p_pred
+
+        self._state[track_id] = x_new
+        self._cov[track_id] = p_new
+
+        x1, y1, x2, y2 = bbox_xyxy
+        bw = max(2.0, float(x2 - x1))
+        bh = max(2.0, float(y2 - y1))
+        prev = self._size_wh.get(track_id)
+        if prev is None:
+            self._size_wh[track_id] = (bw, bh)
+        else:
+            # Smooth bbox size; motion is modeled by Kalman state, size by EMA.
+            self._size_wh[track_id] = (0.8 * prev[0] + 0.2 * bw, 0.8 * prev[1] + 0.2 * bh)
+
+    def mark_missed(self, active_track_ids: set[int]) -> None:
+        for tid in list(self._state.keys()):
+            if tid in active_track_ids:
+                continue
+            self._missed[tid] = int(self._missed.get(tid, 0)) + 1
+
+        max_missed = int(self.cfg.max_missed_frames)
+        for tid in list(self._state.keys()):
+            if int(self._missed.get(tid, 0)) <= max_missed:
+                continue
+            self._state.pop(tid, None)
+            self._cov.pop(tid, None)
+            self._size_wh.pop(tid, None)
+            self._missed.pop(tid, None)
+
+    def predict_n(self, track_id: int) -> Optional[TrajectoryPrediction]:
+        if track_id not in self._state:
+            return None
+
+        x = self._state[track_id].copy()
+        p = self._cov[track_id].copy()
+        bw, bh = self._size_wh.get(track_id, (32.0, 32.0))
+        future_points: List[Tuple[float, float]] = []
+        future_bboxes: List[Tuple[int, int, int, int]] = []
+
+        for _ in range(int(self.cfg.horizon_frames)):
+            x, p = self._predict_only(x, p)
+            px = float(x[0, 0])
+            py = float(x[1, 0])
+            future_points.append((px, py))
+            x1 = int(round(px - bw / 2.0))
+            y1 = int(round(py - bh / 2.0))
+            x2 = int(round(px + bw / 2.0))
+            y2 = int(round(py + bh / 2.0))
+            future_bboxes.append((x1, y1, x2, y2))
+
+        sx = self._state[track_id]
+        return TrajectoryPrediction(
+            track_id=int(track_id),
+            future_points=future_points,
+            future_bboxes=future_bboxes,
+            state_xyvxvy=(float(sx[0, 0]), float(sx[1, 0]), float(sx[2, 0]), float(sx[3, 0])),
+        )
+
+    def update_and_predict(self, tracked_objects: List[TrackedObject]) -> Dict[int, TrajectoryPrediction]:
+        active = set()
+        for obj in tracked_objects:
+            active.add(int(obj.track_id))
+            self._update(int(obj.track_id), obj.centroid_xy, obj.bbox_xyxy)
+        self.mark_missed(active_track_ids=active)
+
+        out: Dict[int, TrajectoryPrediction] = {}
+        for tid in active:
+            pred = self.predict_n(tid)
+            if pred is not None:
+                out[int(tid)] = pred
+        return out
+
+
+class YoloWorldBoTSortPipeline:
+    """Ultralytics YOLO-World detection + BoT-SORT tracking wrapper."""
+
+    def __init__(self, cfg: YoloWorldConfig):
+        self.cfg = cfg
+        self._model = None
+        self._class_names: List[str] = []
+        self._init_model()
+
+    def _init_model(self) -> None:
+        try:
+            from ultralytics import YOLO
+        except Exception as e:  # pragma: no cover - runtime environment dependency
+            raise RuntimeError(
+                "ultralytics is required for YOLO-World + BoT-SORT. Install `ultralytics`."
+            ) from e
+
+        self._model = YOLO(self.cfg.model_name)
+
+        classes = list(self.cfg.classes_en or [])
+        if classes:
+            # YOLO-World text prompts; the model performs open-vocabulary detection.
+            self._model.set_classes(classes)
+            self._class_names = classes
+
+    def infer_and_track(self, frame_bgr: np.ndarray) -> List[TrackedObject]:
+        if self._model is None:
+            return []
+
+        results = self._model.track(
+            source=frame_bgr,
+            conf=float(self.cfg.conf_threshold),
+            iou=float(self.cfg.iou_threshold),
+            tracker=str(self.cfg.tracker_yaml),
+            persist=True,
+            verbose=False,
+        )
+
+        if not results:
+            return []
+
+        result = results[0]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or boxes.xyxy is None:
+            return []
+
+        ids = boxes.id
+        confs = boxes.conf
+        clss = boxes.cls
+
+        out: List[TrackedObject] = []
+        xyxy = boxes.xyxy.cpu().numpy()
+        ids_np = ids.cpu().numpy().astype(int) if ids is not None else np.full((len(xyxy),), -1, dtype=int)
+        conf_np = confs.cpu().numpy() if confs is not None else np.zeros((len(xyxy),), dtype=np.float32)
+        cls_np = clss.cpu().numpy().astype(int) if clss is not None else np.zeros((len(xyxy),), dtype=int)
+
+        for i in range(len(xyxy)):
+            track_id = int(ids_np[i])
+            if track_id < 0:
+                continue
+            x1, y1, x2, y2 = [int(round(v)) for v in xyxy[i].tolist()]
+            bbox = (x1, y1, x2, y2)
+            cls_id = int(cls_np[i])
+            if self._class_names and 0 <= cls_id < len(self._class_names):
+                cls_name = self._class_names[cls_id]
+            else:
+                names = getattr(result, "names", {}) or {}
+                cls_name = str(names.get(cls_id, f"class_{cls_id}"))
+
+            cx, cy = bbox_center(bbox)
+            out.append(
+                TrackedObject(
+                    track_id=track_id,
+                    bbox_xyxy=bbox,
+                    confidence=float(conf_np[i]),
+                    class_name=cls_name,
+                    class_id=cls_id,
+                    centroid_xy=(float(cx), float(cy)),
+                )
+            )
+
+        return out

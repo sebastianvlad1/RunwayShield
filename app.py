@@ -4,19 +4,21 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yaml
 from PIL import Image
 
 from cv_pipeline import (
-    BlobDetector,
-    BlobDetectorConfig,
-    BlobTracker,
-    TrackerConfig,
+    TrajectoryConfig,
+    TrajectoryPredictor,
+    TrackedObject,
+    YoloWorldBoTSortPipeline,
+    YoloWorldConfig,
     bbox_center,
     clamp_bbox,
     crop_roi,
@@ -55,6 +57,68 @@ def extract_points(canvas_json: dict) -> List[Tuple[float, float]]:
     return pts
 
 
+def _default_detection_cfg() -> dict:
+    return {
+        "model": "yolov8s-world.pt",
+        "conf_threshold": 0.25,
+        "iou_threshold": 0.5,
+        "tracker_yaml": "botsort.yaml",
+        "classes": [
+            {"id": 0, "ro": "persoana cu rucsac", "en": "person with backpack"},
+            {"id": 1, "ro": "vehicul de pista", "en": "runway vehicle"},
+            {"id": 2, "ro": "pasare", "en": "bird"},
+            {"id": 3, "ro": "resturi pe pista", "en": "runway debris"},
+        ],
+    }
+
+
+def load_yolo_world_config(path: Path) -> dict:
+    if not path.exists():
+        cfg = {"detection": _default_detection_cfg()}
+        path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        return cfg
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    detection = data.get("detection") or {}
+    merged = _default_detection_cfg()
+    merged.update({k: v for k, v in detection.items() if k in merged and v is not None})
+    classes = detection.get("classes") if isinstance(detection, dict) else None
+    if isinstance(classes, list) and classes:
+        merged["classes"] = classes
+    return {"detection": merged}
+
+
+def yolo_class_prompts_en(cfg: dict) -> List[str]:
+    classes = cfg.get("detection", {}).get("classes", [])
+    prompts: List[str] = []
+    for c in classes:
+        if not isinstance(c, dict):
+            continue
+        en = str(c.get("en", "")).strip()
+        ro = str(c.get("ro", "")).strip()
+        if en:
+            prompts.append(en)
+        elif ro:
+            prompts.append(ro)
+    return prompts
+
+
+def yolo_label_maps(cfg: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
+    en_to_ro: Dict[str, str] = {}
+    en_to_en: Dict[str, str] = {}
+    classes = cfg.get("detection", {}).get("classes", [])
+    for c in classes:
+        if not isinstance(c, dict):
+            continue
+        en = str(c.get("en", "")).strip()
+        ro = str(c.get("ro", "")).strip()
+        if not en:
+            continue
+        en_to_ro[en] = ro or en
+        en_to_en[en] = en
+    return en_to_ro, en_to_en
+
+
 @st.cache_resource(show_spinner=False)
 def get_clip_classifier(cfg: ClipConfig) -> ClipClassifier:
     return ClipClassifier(cfg)
@@ -67,7 +131,12 @@ def get_clip_classifier(cfg: ClipConfig) -> ClipClassifier:
 st.set_page_config(page_title="RunwayShield PoC", layout="wide")
 
 st.title("RunwayShield — Automatic Runway Hazard Detection")
-st.caption("OpenCV change detection → N-of-M incident gating → evidence → fast VLM classification (OpenCLIP)")
+st.caption("YOLO-World + BoT-SORT + Kalman trajectory prediction → N-of-M incident gating → evidence")
+
+config_path = Path("config.yaml")
+yolo_cfg_data = load_yolo_world_config(config_path)
+prompt_classes_en = yolo_class_prompts_en(yolo_cfg_data)
+en_to_ro_label, _ = yolo_label_maps(yolo_cfg_data)
 
 with st.sidebar:
     st.header("Inputs")
@@ -81,26 +150,13 @@ with st.sidebar:
     window_m = st.number_input("Window M (frames)", min_value=5, max_value=120, value=10, step=1)
     confirm_n = st.number_input("Confirm N (in-runway frames)", min_value=2, max_value=60, value=6, step=1)
 
-    st.header("OpenCV detection")
-    min_area = st.number_input("Min blob area (px^2)", min_value=20, max_value=20000, value=250, step=10)
-    max_area = st.number_input("Max blob area (px^2)", min_value=100, max_value=400000, value=45000, step=500)
+    st.header("YOLO-World detection")
+    yolo_conf = st.slider("YOLO confidence", 0.05, 0.95, float(yolo_cfg_data["detection"]["conf_threshold"]), 0.01)
+    yolo_iou = st.slider("YOLO IoU", 0.05, 0.95, float(yolo_cfg_data["detection"]["iou_threshold"]), 0.01)
     warmup_secs = st.number_input("Warm-up seconds", min_value=0, max_value=30, value=3, step=1)
 
-    with st.expander("Advanced detection", expanded=False):
-        bg_history = st.slider("MOG2 history", min_value=100, max_value=1500, value=400, step=50)
-        var_threshold = st.slider("MOG2 varThreshold", min_value=4, max_value=64, value=16, step=2)
-        detect_shadows = st.checkbox("MOG2 detectShadows", value=True)
-        learning_rate = st.slider("Learning rate", 0.0, 0.05, 0.005, 0.001)
-        diff_threshold = st.slider("Median absdiff threshold", min_value=5, max_value=60, value=22, step=1)
-        morph_kernel = st.select_slider("Morph kernel", options=[3, 5, 7], value=3)
-        morph_iters = st.slider("Morph iterations", min_value=1, max_value=5, value=2, step=1)
-        max_fg_ratio = st.slider("Max foreground ratio (shake guard)", 0.05, 0.60, 0.25, 0.05)
-        min_extent = st.slider("Min extent", 0.05, 0.50, 0.15, 0.01)
-        min_solidity = st.slider("Min solidity", 0.05, 0.80, 0.30, 0.01)
-
-    st.header("Tracking")
-    tracker_iou = st.slider("Tracker IoU", 0.05, 0.70, 0.25, 0.05)
-    tracker_max_missed = st.slider("Tracker max missed", 1, 60, 10, 1)
+    st.header("Trajectory prediction")
+    horizon_frames = st.slider("Prediction horizon N (frames)", 3, 60, 10, 1)
 
     st.header("Evidence")
     prebuffer_secs = st.number_input("Pre-buffer seconds", min_value=1, max_value=30, value=5, step=1)
@@ -133,6 +189,10 @@ with st.sidebar:
         debris_detail_thr = st.slider("Debris detail threshold", 0.10, 0.95, 0.45, 0.01)
 
     st.divider()
+    st.caption(f"YOLO classes loaded from `{config_path}`")
+    for cls in yolo_cfg_data["detection"]["classes"]:
+        st.write(f"- {cls.get('ro', '-')}: `{cls.get('en', '-')}`")
+
     run_btn = st.button("▶ Start", type="primary")
 
 
@@ -236,6 +296,9 @@ with colB:
 
     st.dataframe(pd.DataFrame(poly_points, columns=["x", "y"]).round(1), use_container_width=True, height=220)
 
+    st.markdown("### YOLO classes (RO)")
+    st.write(", ".join([en_to_ro_label.get(c, c) for c in prompt_classes_en]))
+
     st.markdown("### VLM categories")
     st.write(", ".join(CATEGORIES))
 
@@ -271,23 +334,16 @@ effective_fps = int(proc_fps)
 # Components
 engine = IncidentEngine(confirm_n=int(confirm_n), window_m=int(window_m))
 
-det_cfg = BlobDetectorConfig(
-    min_area=int(min_area),
-    max_area=int(max_area),
-    history=int(bg_history),
-    var_threshold=int(var_threshold),
-    detect_shadows=bool(detect_shadows),
-    learning_rate=float(learning_rate),
-    diff_threshold=int(diff_threshold),
-    morph_kernel=int(morph_kernel),
-    morph_iters=int(morph_iters),
-    max_fg_ratio=float(max_fg_ratio),
-    min_extent=float(min_extent),
-    min_solidity=float(min_solidity),
+yolo_pipeline = YoloWorldBoTSortPipeline(
+    YoloWorldConfig(
+        model_name=str(yolo_cfg_data["detection"]["model"]),
+        conf_threshold=float(yolo_conf),
+        iou_threshold=float(yolo_iou),
+        tracker_yaml=str(yolo_cfg_data["detection"].get("tracker_yaml", "botsort.yaml")),
+        classes_en=prompt_classes_en,
+    )
 )
-
-detector = BlobDetector(det_cfg)
-tracker = BlobTracker(TrackerConfig(iou_threshold=float(tracker_iou), max_missed=int(tracker_max_missed)))
+traj_predictor = TrajectoryPredictor(TrajectoryConfig(horizon_frames=int(horizon_frames)))
 
 prebuffer_frames = max(1, int(float(prebuffer_secs) * effective_fps))
 postbuffer_frames = max(1, int(float(postbuffer_secs) * effective_fps))
@@ -352,25 +408,36 @@ while True:
 
     # Warmup
     if processed < warmup_frames:
-        detector.warmup(frame, runway_mask)
-        boxes_with_conf, fgmask = ([], np.zeros((frame_h, frame_w), dtype=np.uint8))
+        tracked_objects: List[TrackedObject] = []
     else:
-        boxes_with_conf, fgmask = detector.detect(frame, runway_mask)
+        tracked_objects = yolo_pipeline.infer_and_track(frame)
 
-    boxes_xyxy = [(b[0], b[1], b[2], b[3]) for b in boxes_with_conf]
-    conf_map = {(b[0], b[1], b[2], b[3]): float(b[4]) for b in boxes_with_conf}
-
-    tracked = tracker.update(boxes_xyxy)
+    trajectory_map = traj_predictor.update_and_predict(tracked_objects)
 
     seen_tids: List[int] = []
-    for box, tid in tracked:
-        x1, y1, x2, y2 = clamp_bbox(box, frame_w, frame_h)
+    for obj in tracked_objects:
+        x1, y1, x2, y2 = clamp_bbox(obj.bbox_xyxy, frame_w, frame_h)
         cx, cy = bbox_center((x1, y1, x2, y2))
-        if not point_in_polygon(poly, cx, cy):
+        in_runway_now = point_in_polygon(poly, cx, cy)
+
+        pred = trajectory_map.get(int(obj.track_id))
+        future_points = pred.future_points if pred is not None else []
+        will_enter_runway = any(point_in_polygon(poly, px, py) for px, py in future_points)
+
+        if not in_runway_now and not will_enter_runway:
             continue
-        seen_tids.append(int(tid))
-        conf = conf_map.get((x1, y1, x2, y2), 0.6)
-        engine.on_detection(int(tid), True, (x1, y1, x2, y2), float(conf))
+
+        seen_tids.append(int(obj.track_id))
+        engine.on_detection(
+            track_id=int(obj.track_id),
+            in_runway=bool(in_runway_now or will_enter_runway),
+            bbox_xyxy=(x1, y1, x2, y2),
+            conf=float(obj.confidence),
+            detector_label=str(obj.class_name),
+            predicted_intrusion=bool(will_enter_runway and not in_runway_now),
+            predicted_points=future_points,
+            trajectory_horizon=int(horizon_frames),
+        )
 
     engine.update_tracks(seen_tids)
 
@@ -427,22 +494,31 @@ while True:
     overlay = frame.copy()
     cv2.polylines(overlay, [poly], isClosed=True, color=(0, 255, 0), thickness=2)
 
-    for box, tid in tracked:
-        x1, y1, x2, y2 = clamp_bbox(box, frame_w, frame_h)
+    for obj in tracked_objects:
+        x1, y1, x2, y2 = clamp_bbox(obj.bbox_xyxy, frame_w, frame_h)
         cx, cy = bbox_center((x1, y1, x2, y2))
-        if not point_in_polygon(poly, cx, cy):
+        pred = trajectory_map.get(int(obj.track_id))
+        future_points = pred.future_points if pred is not None else []
+        if not point_in_polygon(poly, cx, cy) and not any(point_in_polygon(poly, px, py) for px, py in future_points):
             continue
         cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        label_ro = en_to_ro_label.get(obj.class_name, obj.class_name)
         cv2.putText(
             overlay,
-            f"blob#{tid}",
+            f"id#{obj.track_id} {label_ro} {obj.confidence:.2f}",
             (x1, max(0, y1 - 7)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.50,
             (0, 0, 255),
             2,
             cv2.LINE_AA,
         )
+
+        if future_points:
+            for px, py in future_points:
+                cv2.circle(overlay, (int(px), int(py)), 2, (255, 200, 0), -1)
+            pts = np.array([[int(px), int(py)] for px, py in future_points], dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(overlay, [pts], isClosed=False, color=(255, 200, 0), thickness=2)
 
     rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
     video_ph.image(rgb, channels="RGB", caption=f"Processed frame {processed}")

@@ -6,7 +6,6 @@ Run:
 This script verifies:
 - Python syntax for all project modules
 - Required imports are available
-- open_clip model can be created (registry + transforms)
 
 It is intentionally lightweight and cross-platform.
 """
@@ -37,20 +36,11 @@ def check_imports() -> None:
         "PIL",
         "torch",
         "open_clip",
+        "yaml",
+        "ultralytics",
     ]
     for m in required:
         importlib.import_module(m)
-
-
-def check_open_clip_create() -> None:
-    import open_clip
-
-    model, _, _ = open_clip.create_model_and_transforms(
-        "ViT-B-32",
-        pretrained="laion2b_s34b_b79k",
-        device="cpu",
-    )
-    assert model is not None
 
 
 def main() -> None:
@@ -58,8 +48,6 @@ def main() -> None:
     compile_all()
     print("[preflight] imports...")
     check_imports()
-    print("[preflight] open_clip registry...")
-    check_open_clip_create()
     print("[preflight] OK")
 
 

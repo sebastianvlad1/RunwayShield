@@ -26,6 +26,10 @@ class Incident:
 
     bbox_xyxy: Tuple[int, int, int, int]
     candidate_conf: float
+    detector_label: Optional[str] = None
+    predicted_intrusion: bool = False
+    trajectory_horizon: int = 0
+    predicted_points: Optional[List[Tuple[float, float]]] = None
 
     evidence_image_path: Optional[str] = None
     evidence_video_path: Optional[str] = None
@@ -87,6 +91,10 @@ class IncidentEngine:
         self.track_hist: Dict[int, Deque[bool]] = defaultdict(lambda: deque(maxlen=self.window_m))
         self.track_last_bbox: Dict[int, Tuple[int, int, int, int]] = {}
         self.track_last_conf: Dict[int, float] = {}
+        self.track_last_label: Dict[int, str] = {}
+        self.track_pred_intrusion: Dict[int, bool] = defaultdict(bool)
+        self.track_pred_points: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
+        self.track_traj_horizon: Dict[int, int] = defaultdict(int)
 
         self.incidents: Dict[str, Incident] = {}
         self.incident_by_track: Dict[int, str] = {}
@@ -101,10 +109,25 @@ class IncidentEngine:
             if tid not in seen:
                 hist.append(False)
 
-    def on_detection(self, track_id: int, in_runway: bool, bbox_xyxy: Tuple[int, int, int, int], conf: float) -> None:
+    def on_detection(
+        self,
+        track_id: int,
+        in_runway: bool,
+        bbox_xyxy: Tuple[int, int, int, int],
+        conf: float,
+        detector_label: Optional[str] = None,
+        predicted_intrusion: bool = False,
+        predicted_points: Optional[List[Tuple[float, float]]] = None,
+        trajectory_horizon: int = 0,
+    ) -> None:
         self.track_hist[track_id].append(bool(in_runway))
         self.track_last_bbox[track_id] = bbox_xyxy
         self.track_last_conf[track_id] = float(conf)
+        if detector_label:
+            self.track_last_label[track_id] = str(detector_label)
+        self.track_pred_intrusion[track_id] = bool(predicted_intrusion)
+        self.track_pred_points[track_id] = list(predicted_points or [])
+        self.track_traj_horizon[track_id] = int(trajectory_horizon)
 
     def maybe_open_incidents(
         self,
@@ -123,6 +146,10 @@ class IncidentEngine:
                 inc.last_frame = frame_idx
                 inc.bbox_xyxy = self.track_last_bbox.get(tid, inc.bbox_xyxy)
                 inc.candidate_conf = self.track_last_conf.get(tid, inc.candidate_conf)
+                inc.detector_label = self.track_last_label.get(tid, inc.detector_label)
+                inc.predicted_intrusion = bool(self.track_pred_intrusion.get(tid, inc.predicted_intrusion))
+                inc.predicted_points = self.track_pred_points.get(tid, inc.predicted_points)
+                inc.trajectory_horizon = int(self.track_traj_horizon.get(tid, inc.trajectory_horizon))
                 continue
 
             if sum(hist) >= self.confirm_n:
@@ -152,6 +179,10 @@ class IncidentEngine:
                     track_id=tid,
                     bbox_xyxy=bbox,
                     candidate_conf=float(self.track_last_conf.get(tid, 0.6)),
+                    detector_label=self.track_last_label.get(tid),
+                    predicted_intrusion=bool(self.track_pred_intrusion.get(tid, False)),
+                    trajectory_horizon=int(self.track_traj_horizon.get(tid, 0)),
+                    predicted_points=self.track_pred_points.get(tid),
                     evidence_image_path=img_path,
                     evidence_video_path=vid_path,
                 )
@@ -187,6 +218,9 @@ class IncidentEngine:
             "first_frame",
             "last_frame",
             "track_id",
+            "detector_label",
+            "predicted_intrusion",
+            "trajectory_horizon",
             "candidate_conf",
             "evidence_video_path",
             "evidence_image_path",
