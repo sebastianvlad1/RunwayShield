@@ -5,17 +5,8 @@ detection:
   tracker_yaml: "botsort.yaml"
   classes:
     - id: 0
-      ro: "persoana cu rucsac"
-      en: "person with backpack"
+      ro: "persoana care merge"
+      en: "person walking"
     - id: 1
-      ro: "vehicul de pista"
-      en: "runway vehicle"
-    - id: 2
-      ro: "pasare"
-      en: "bird"
-    - id: 3
-      ro: "persoana"
-      en: "person"
-    - id: 4
       ro: "avion"
       en: "airplane"

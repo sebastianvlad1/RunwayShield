@@ -163,7 +163,7 @@ with st.sidebar:
     postbuffer_secs = st.number_input("Post-buffer seconds", min_value=1, max_value=30, value=5, step=1)
 
     st.header("VLM classification (fast + stable)")
-    enable_vlm = st.checkbox("Enable VLM classify", value=True)
+    enable_vlm = st.checkbox("Enable VLM classify", value=False)
 
     vlm_model = "ViT-B-32"
     vlm_pretrained = "laion2b_s34b_b79k"
@@ -499,9 +499,12 @@ while True:
         cx, cy = bbox_center((x1, y1, x2, y2))
         pred = trajectory_map.get(int(obj.track_id))
         future_points = pred.future_points if pred is not None else []
-        if not point_in_polygon(poly, cx, cy) and not any(point_in_polygon(poly, px, py) for px, py in future_points):
+        in_runway_now = point_in_polygon(poly, cx, cy)
+        will_enter_runway = any(point_in_polygon(poly, px, py) for px, py in future_points)
+        if not in_runway_now and not will_enter_runway:
             continue
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        box_color = (0, 0, 255) if in_runway_now else (0, 255, 255)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), box_color, 2)
         label_ro = en_to_ro_label.get(obj.class_name, obj.class_name)
         cv2.putText(
             overlay,
@@ -509,7 +512,7 @@ while True:
             (x1, max(0, y1 - 7)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
-            (0, 0, 255),
+            box_color,
             2,
             cv2.LINE_AA,
         )
