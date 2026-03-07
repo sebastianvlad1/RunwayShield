@@ -1,6 +1,6 @@
-# RunwayShield PoC (CV trigger + VLM classify)
+# RunwayShield PoC (YOLO-World + VLM classify)
 
-This PoC detects **new / moving objects** inside a **runway polygon** using OpenCV change detection, opens incidents via an **N-of-M persistence gate**, saves **evidence (snapshot + clip)**, and (optionally) classifies the incident ROI using a **fast vision-language model (CLIP via open_clip)**.
+This PoC detects hazards inside a **runway polygon** using **YOLO-World + BoT-SORT tracking**, opens incidents via an **N-of-M persistence gate**, stores **evidence (snapshot + clip)**, and (optionally) classifies the incident ROI with a **fast vision-language model (CLIP via open_clip)**.
 
 Why CLIP (open_clip) instead of a large generative VLM (e.g. Qwen2.5-VL)?
 - It is **much faster and more stable** on CPU/Mac/Windows.
@@ -32,10 +32,10 @@ python -m streamlit run app.py
 1. Upload a runway video.
 2. Define runway area by clicking points (polygon).
 3. For each processed frame:
-   - OpenCV change detection (MOG2 + median background diff) finds candidate blobs **inside the runway mask**.
-   - Filters remove noise (area/shape, camera-shake guard).
-   - IoU tracking gives stable `track_id`.
-   - N-of-M gating opens an incident only if the blob persists.
+  - YOLO-World detects objects from configured text classes.
+  - BoT-SORT provides stable `track_id` values.
+  - Kalman trajectory prediction (`horizon_frames`) marks tracks that are already in runway or predicted to enter runway.
+  - N-of-M gating opens an incident only if the track persists.
 4. Optional: VLM classification runs on 1-3 ROI crops around the blob and outputs:
    - `category` in {person, vehicle, bird, animal, debris, shadow, unknown}
    - `real` (true/false)
@@ -107,7 +107,7 @@ python headless_runner.py --source video.mp4 --polygon polygon.json \
 
 Each incident line is a JSON object, for example:
 ```json
-{"event": "INCIDENT_OPEN", "ts": 1710000000.0, "incident_id": "INC-0001", "track_id": 3, "severity": "HIGH", "bbox": [120, 340, 200, 420], "detector_label": "person walking"}
+{"incident_id": "INC-1710000000000", "status": "OPEN", "severity": "MED", "track_id": 3, "detector_label": "person walking", "bbox": [120, 340, 200, 420], "vlm_category": "person", "vlm_detail": null, "vlm_confidence": 0.91, "vlm_real": true, "evidence_image": "artifacts/INC-1710000000000_snapshot.jpg", "evidence_video": "artifacts/INC-1710000000000_evidence.mp4"}
 ```
 
 All incidents are also written to `artifacts/incidents.jsonl`.
@@ -122,6 +122,7 @@ python headless_runner.py --help
 |---|---|---|
 | `--source` | **required** | Video path, webcam index (`0`), or RTSP URL |
 | `--polygon` | **required** | Path to polygon JSON or YAML file (min 3 points) |
+| `--config` | `config.yaml` | Path to project YAML detection config (YOLO model/classes/threshold defaults) |
 | `--mode` | `file` | `file` \| `file_live` \| `webcam` \| `rtsp` |
 | `--loop` | `False` | Loop file infinitely at EOF (only for `file_live`) |
 | `--output-dir` | `artifacts` | Directory for evidence clips, snapshots, and JSONL log |
