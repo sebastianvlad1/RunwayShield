@@ -26,10 +26,9 @@ from vlm_clip import CATEGORIES
 
 def _default_detection_cfg() -> dict:
     return {
-        "model": "yolov8s-world.pt",
+        "model": "IDEA-Research/grounding-dino-tiny",
         "conf_threshold": 0.25,
         "iou_threshold": 0.5,
-        "tracker_yaml": "botsort.yaml",
         "classes": [
             {"id": 0, "ro": "persoana cu rucsac", "en": "person with backpack"},
             {"id": 1, "ro": "vehicul de pista", "en": "runway vehicle"},
@@ -93,7 +92,7 @@ def yolo_label_maps(cfg: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
 st.set_page_config(page_title="RunwayShield PoC", layout="wide")
 
 st.title("RunwayShield — Automatic Runway Hazard Detection")
-st.caption("YOLO-World + BoT-SORT + Kalman trajectory prediction → N-of-M incident gating → evidence")
+st.caption("GroundingDINO + IoU tracker + Kalman trajectory prediction → N-of-M incident gating → evidence")
 
 config_path = Path("config.yaml")
 yolo_cfg_data = load_yolo_world_config(config_path)
@@ -155,9 +154,10 @@ with st.sidebar:
     window_m = st.number_input("Window M (frames)", min_value=5, max_value=120, value=10, step=1)
     confirm_n = st.number_input("Confirm N (in-runway frames)", min_value=2, max_value=60, value=6, step=1)
 
-    st.header("YOLO-World detection")
-    yolo_conf = st.slider("YOLO confidence", 0.05, 0.95, float(yolo_cfg_data["detection"]["conf_threshold"]), 0.01)
-    yolo_iou = st.slider("YOLO IoU", 0.05, 0.95, float(yolo_cfg_data["detection"]["iou_threshold"]), 0.01)
+    st.header("GroundingDINO detection")
+    yolo_device = st.selectbox("Detection device", ["auto", "cpu", "cuda", "mps"], index=0)
+    yolo_conf = st.slider("Detection confidence", 0.05, 0.95, float(yolo_cfg_data["detection"]["conf_threshold"]), 0.01)
+    yolo_iou = st.slider("Detection IoU", 0.05, 0.95, float(yolo_cfg_data["detection"]["iou_threshold"]), 0.01)
     warmup_secs = st.number_input("Warm-up seconds", min_value=0, max_value=30, value=3, step=1)
 
     st.header("Trajectory prediction")
@@ -302,7 +302,7 @@ with colA:
     st.image(
         Image.fromarray(cv2.cvtColor(_first_frame, cv2.COLOR_BGR2RGB)),
         caption="First frame — enter runway points on the right",
-        use_container_width=True,
+        width="stretch",
     )
 
 poly_points: List[Tuple[float, float]] = []
@@ -358,7 +358,7 @@ with colB:
         st.image(
             Image.fromarray(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)),
             caption="Runway polygon preview",
-            use_container_width=True,
+            width="stretch",
         )
 
     if len(poly_points) < 3:
@@ -367,7 +367,7 @@ with colB:
         st.success(f"{len(poly_points)} points captured.")
 
     st.dataframe(pd.DataFrame(poly_points, columns=["x", "y"]).round(1),
-                 use_container_width=True, height=220)
+                 width="stretch", height=220)
 
     st.markdown("### YOLO classes (RO)")
     st.write(", ".join([en_to_ro_label.get(c, c) for c in prompt_classes_en]))
@@ -408,7 +408,7 @@ runtime_cfg = RuntimeConfig(
     yolo_model=str(yolo_cfg_data["detection"]["model"]),
     yolo_conf=float(yolo_conf),
     yolo_iou=float(yolo_iou),
-    yolo_tracker_yaml=str(yolo_cfg_data["detection"].get("tracker_yaml", "botsort.yaml")),
+    yolo_device=str(yolo_device),
     yolo_classes_en=prompt_classes_en,
     horizon_frames=int(horizon_frames),
     prebuffer_secs=float(prebuffer_secs),
@@ -491,7 +491,7 @@ for result in runtime.run():
                 icon=status_icon,
             )
 
-    inc_ph.dataframe(runtime.incidents_table(), use_container_width=True, height=300)
+    inc_ph.dataframe(runtime.incidents_table(), width="stretch", height=300)
 
     elapsed = time.time() - t0
     fps_eff = result.effective_fps

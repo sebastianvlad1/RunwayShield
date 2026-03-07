@@ -139,9 +139,10 @@ def _build_runtime_config(args: argparse.Namespace, detection_cfg: dict) -> Runt
         warmup_secs=float(args.warmup_secs),
         confirm_n=int(args.confirm_n),
         window_m=int(args.window_m),
-        yolo_model=str(detection_cfg.get("model", "yolov8s-world.pt")),
+        yolo_model=str(detection_cfg.get("model", "IDEA-Research/grounding-dino-tiny")),
         yolo_conf=float(args.yolo_conf or detection_cfg.get("conf_threshold", 0.25)),
         yolo_iou=float(args.yolo_iou or detection_cfg.get("iou_threshold", 0.50)),
+        yolo_device=str(args.yolo_device),
         yolo_tracker_yaml=str(detection_cfg.get("tracker_yaml", "botsort.yaml")),
         yolo_classes_en=classes_en,
         horizon_frames=int(args.horizon_frames),
@@ -226,11 +227,14 @@ def _build_parser() -> argparse.ArgumentParser:
     gating.add_argument("--warmup-secs", type=float, default=3.0,
                         help="Background warmup seconds before detection starts.")
 
-    yolo = p.add_argument_group("YOLO detection")
+    yolo = p.add_argument_group("Detection (GroundingDINO)")
+    yolo.add_argument("--yolo-device", default="auto",
+                      choices=["auto", "cpu", "cuda", "mps"],
+                      help="Device for GroundingDINO inference.")
     yolo.add_argument("--yolo-conf", type=float, default=None,
-                      help="YOLO confidence threshold (overrides config.yaml).")
+                      help="Detection confidence threshold (overrides config.yaml).")
     yolo.add_argument("--yolo-iou", type=float, default=None,
-                      help="YOLO IoU threshold (overrides config.yaml).")
+                      help="Detection IoU threshold (overrides config.yaml).")
     yolo.add_argument("--horizon-frames", type=int, default=10,
                       help="Kalman trajectory prediction horizon (frames).")
 

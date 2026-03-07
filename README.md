@@ -1,6 +1,6 @@
-# RunwayShield PoC (YOLO-World + VLM classify)
+# RunwayShield PoC (GroundingDINO + VLM classify)
 
-This PoC detects hazards inside a **runway polygon** using **YOLO-World + BoT-SORT tracking**, opens incidents via an **N-of-M persistence gate**, stores **evidence (snapshot + clip)**, and (optionally) classifies the incident ROI with a **fast vision-language model (CLIP via open_clip)**.
+This PoC detects hazards inside a **runway polygon** using **GroundingDINO + IoU tracking**, opens incidents via an **N-of-M persistence gate**, stores **evidence (snapshot + clip)**, and (optionally) classifies the incident ROI with a **fast vision-language model (CLIP via open_clip)**.
 
 Why CLIP (open_clip) instead of a large generative VLM (e.g. Qwen2.5-VL)?
 - It is **much faster and more stable** on CPU/Mac/Windows.
@@ -32,8 +32,8 @@ python -m streamlit run app.py
 1. Upload a runway video.
 2. Define runway area by clicking points (polygon).
 3. For each processed frame:
-  - YOLO-World detects objects from configured text classes.
-  - BoT-SORT provides stable `track_id` values.
+  - GroundingDINO detects objects from configured text classes.
+  - IoU tracker provides stable `track_id` values.
   - Kalman trajectory prediction (`horizon_frames`) marks tracks that are already in runway or predicted to enter runway.
   - N-of-M gating opens an incident only if the track persists.
 4. Optional: VLM classification runs on 1-3 ROI crops around the blob and outputs:

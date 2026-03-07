@@ -290,17 +290,21 @@ class BlobTracker:
 
 
 # ----------------------------
-# YOLO-World + BoT-SORT + Kalman prediction
+# GroundingDINO + IoU tracker + Kalman prediction
 # ----------------------------
 
 
 @dataclass
-class YoloWorldConfig:
-    model_name: str = "yolov8s-world.pt"
+class GroundingDINOConfig:
+    model_name: str = "IDEA-Research/grounding-dino-tiny"
     conf_threshold: float = 0.25
     iou_threshold: float = 0.50
-    tracker_yaml: str = "botsort.yaml"
+    device: str = "auto"   # auto | cpu | cuda | mps
     classes_en: Optional[List[str]] = None
+
+
+# Keep aliases so existing RuntimeConfig field names still work
+YoloWorldConfig = GroundingDINOConfig
 
 
 @dataclass
@@ -464,81 +468,144 @@ class TrajectoryPredictor:
         return out
 
 
-class YoloWorldBoTSortPipeline:
-    """Ultralytics YOLO-World detection + BoT-SORT tracking wrapper."""
+class GroundingDINOPipeline:
+    """GroundingDINO detection + IoU tracking wrapper.
 
-    def __init__(self, cfg: YoloWorldConfig):
+    Drop-in replacement for the former YOLO-World pipeline.
+    Uses HuggingFace transformers for zero-shot object detection and the
+    existing BlobTracker (IoU-based) for frame-to-frame tracking.
+    """
+
+    def __init__(self, cfg: GroundingDINOConfig):
         self.cfg = cfg
+        self._processor = None
         self._model = None
         self._class_names: List[str] = []
+        self._text_prompt: str = ""
+        self._tracker = BlobTracker(TrackerConfig(iou_threshold=cfg.iou_threshold))
         self._init_model()
 
     def _init_model(self) -> None:
         try:
-            from ultralytics import YOLO
-        except Exception as e:  # pragma: no cover - runtime environment dependency
+            import torch
+            from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+        except Exception as e:
             raise RuntimeError(
-                "ultralytics is required for YOLO-World + BoT-SORT. Install `ultralytics`."
+                "transformers is required for GroundingDINO. "
+                "Install: pip install transformers"
             ) from e
 
-        self._model = YOLO(self.cfg.model_name)
+        self._torch = torch
+        self._device = self._resolve_device(self.cfg.device)
+
+        self._processor = AutoProcessor.from_pretrained(self.cfg.model_name)
+
+        dtype = torch.float16 if self._device == "cuda" else torch.float32
+        self._model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            self.cfg.model_name, dtype=dtype
+        ).to(self._device)
+        self._model.eval()
 
         classes = list(self.cfg.classes_en or [])
         if classes:
-            # YOLO-World text prompts; the model performs open-vocabulary detection.
-            self._model.set_classes(classes)
             self._class_names = classes
+            self._text_prompt = " . ".join(classes) + " ."
+        else:
+            self._text_prompt = "object ."
+            self._class_names = ["object"]
+
+    @staticmethod
+    def _resolve_device(pref: str) -> str:
+        import torch
+        pref = (pref or "auto").lower().strip()
+        if pref == "cpu":
+            return "cpu"
+        if pref == "cuda":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        if pref == "mps":
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
+        # auto
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
 
     def infer_and_track(self, frame_bgr: np.ndarray) -> List[TrackedObject]:
-        if self._model is None:
+        if self._model is None or self._processor is None:
             return []
 
-        results = self._model.track(
-            source=frame_bgr,
-            conf=float(self.cfg.conf_threshold),
-            iou=float(self.cfg.iou_threshold),
-            tracker=str(self.cfg.tracker_yaml),
-            persist=True,
-            verbose=False,
+        torch = self._torch
+        from PIL import Image as PILImage
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = PILImage.fromarray(frame_rgb)
+
+        inputs = self._processor(
+            images=pil_img, text=self._text_prompt, return_tensors="pt"
+        ).to(self._device)
+
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+
+        results = self._processor.post_process_grounded_object_detection(
+            outputs,
+            inputs["input_ids"],
+            threshold=float(self.cfg.conf_threshold),
+            text_threshold=float(self.cfg.conf_threshold),
+            target_sizes=[pil_img.size[::-1]],  # (h, w)
         )
 
         if not results:
             return []
 
         result = results[0]
-        boxes = getattr(result, "boxes", None)
-        if boxes is None or boxes.xyxy is None:
+        boxes_tensor = result["boxes"]      # (N, 4) in xyxy
+        scores = result["scores"]           # (N,)
+        labels = result.get("text_labels", result.get("labels", []))
+
+        if len(boxes_tensor) == 0:
             return []
 
-        ids = boxes.id
-        confs = boxes.conf
-        clss = boxes.cls
+        boxes_np = boxes_tensor.cpu().numpy()
+        scores_np = scores.cpu().numpy()
+
+        # Build raw bboxes for IoU tracker
+        raw_boxes: List[Tuple[int, int, int, int]] = []
+        for i in range(len(boxes_np)):
+            x1, y1, x2, y2 = [int(round(v)) for v in boxes_np[i].tolist()]
+            raw_boxes.append((x1, y1, x2, y2))
+
+        # Run IoU tracker
+        tracked = self._tracker.update(raw_boxes)
 
         out: List[TrackedObject] = []
-        xyxy = boxes.xyxy.cpu().numpy()
-        ids_np = ids.cpu().numpy().astype(int) if ids is not None else np.full((len(xyxy),), -1, dtype=int)
-        conf_np = confs.cpu().numpy() if confs is not None else np.zeros((len(xyxy),), dtype=np.float32)
-        cls_np = clss.cpu().numpy().astype(int) if clss is not None else np.zeros((len(xyxy),), dtype=int)
+        for (box, track_id), idx in zip(tracked, range(len(tracked))):
+            # Map tracked box back to original detection index
+            det_idx = raw_boxes.index(box) if box in raw_boxes else idx
+            if det_idx >= len(scores_np):
+                det_idx = min(idx, len(scores_np) - 1)
 
-        for i in range(len(xyxy)):
-            track_id = int(ids_np[i])
-            if track_id < 0:
-                continue
-            x1, y1, x2, y2 = [int(round(v)) for v in xyxy[i].tolist()]
-            bbox = (x1, y1, x2, y2)
-            cls_id = int(cls_np[i])
-            if self._class_names and 0 <= cls_id < len(self._class_names):
-                cls_name = self._class_names[cls_id]
-            else:
-                names = getattr(result, "names", {}) or {}
-                cls_name = str(names.get(cls_id, f"class_{cls_id}"))
+            conf = float(scores_np[det_idx])
+            label_text = labels[det_idx] if det_idx < len(labels) else "object"
 
-            cx, cy = bbox_center(bbox)
+            # Map label text to class index
+            cls_id = 0
+            cls_name = label_text
+            for ci, cn in enumerate(self._class_names):
+                if cn.lower() in label_text.lower() or label_text.lower() in cn.lower():
+                    cls_id = ci
+                    cls_name = cn
+                    break
+
+            cx, cy = bbox_center(box)
             out.append(
                 TrackedObject(
                     track_id=track_id,
-                    bbox_xyxy=bbox,
-                    confidence=float(conf_np[i]),
+                    bbox_xyxy=box,
+                    confidence=conf,
                     class_name=cls_name,
                     class_id=cls_id,
                     centroid_xy=(float(cx), float(cy)),
@@ -546,3 +613,7 @@ class YoloWorldBoTSortPipeline:
             )
 
         return out
+
+
+# Keep alias so existing imports still work
+YoloWorldBoTSortPipeline = GroundingDINOPipeline

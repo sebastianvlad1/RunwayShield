@@ -1,12 +1,11 @@
 detection:
-  model: "yolov8s-world.pt"
+  model: "IDEA-Research/grounding-dino-tiny"
   conf_threshold: 0.25
   iou_threshold: 0.50
-  tracker_yaml: "botsort.yaml"
   classes:
     - id: 0
-      ro: "persoana care merge"
-      en: "person walking"
+      ro: "persoana cu tricou alb"
+      en: "person with white t-shirt"
     - id: 1
       ro: "avion"
       en: "airplane"

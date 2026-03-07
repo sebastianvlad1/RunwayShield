@@ -5,5 +5,5 @@ pandas>=2.0
 pillow>=10.0
 torch>=2.1
 open_clip_torch>=2.24.0
-ultralytics>=8.3.0
+transformers>=4.40.0
 PyYAML>=6.0.1

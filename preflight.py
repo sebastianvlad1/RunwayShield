@@ -37,7 +37,7 @@ def check_imports() -> None:
         "torch",
         "open_clip",
         "yaml",
-        "ultralytics",
+        "transformers",
     ]
     for m in required:
         importlib.import_module(m)

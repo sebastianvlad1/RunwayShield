@@ -33,11 +33,11 @@ import cv2
 import numpy as np
 
 from cv_pipeline import (
+    GroundingDINOConfig,
+    GroundingDINOPipeline,
     TrajectoryConfig,
     TrajectoryPredictor,
     TrackedObject,
-    YoloWorldBoTSortPipeline,
-    YoloWorldConfig,
     bbox_center,
     clamp_bbox,
     crop_roi,
@@ -87,11 +87,12 @@ class RuntimeConfig:
     confirm_n: int = 6
     window_m: int = 10
 
-    # --- YOLO ---
-    yolo_model: str = "yolov8s-world.pt"
+    # --- Detection (GroundingDINO) ---
+    yolo_model: str = "IDEA-Research/grounding-dino-tiny"
     yolo_conf: float = 0.25
     yolo_iou: float = 0.50
-    yolo_tracker_yaml: str = "botsort.yaml"
+    yolo_device: str = "auto"
+    yolo_tracker_yaml: str = "botsort.yaml"  # kept for config compat; unused by GroundingDINO
     yolo_classes_en: List[str] = field(default_factory=list)
 
     # --- Trajectory ---
@@ -362,13 +363,13 @@ class RunwayShieldRuntime:
 
         effective_fps = cfg.proc_fps
 
-        # YOLO pipeline
-        self._yolo = YoloWorldBoTSortPipeline(
-            YoloWorldConfig(
+        # Detection pipeline (GroundingDINO + IoU tracker)
+        self._yolo = GroundingDINOPipeline(
+            GroundingDINOConfig(
                 model_name=cfg.yolo_model,
                 conf_threshold=cfg.yolo_conf,
                 iou_threshold=cfg.yolo_iou,
-                tracker_yaml=cfg.yolo_tracker_yaml,
+                device=cfg.yolo_device,
                 classes_en=cfg.yolo_classes_en,
             )
         )
