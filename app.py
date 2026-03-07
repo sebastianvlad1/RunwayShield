@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import math
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -14,47 +12,16 @@ import yaml
 from PIL import Image
 
 from cv_pipeline import (
-    TrajectoryConfig,
-    TrajectoryPredictor,
-    TrackedObject,
-    YoloWorldBoTSortPipeline,
-    YoloWorldConfig,
-    bbox_center,
-    clamp_bbox,
-    crop_roi,
-    make_runway_mask,
-    point_in_polygon,
-    polygon_from_points,
     resize_keep_aspect,
     sort_polygon_points,
 )
-from incident import IncidentEngine, normalized_across_runway_distance, severity_for
-from recorder import RecorderConfig, RecorderManager, ensure_artifacts_dir
-from vlm_clip import ClipClassifier, ClipConfig, CATEGORIES
+from headless_runtime import RunwayShieldRuntime, RuntimeConfig
+from vlm_clip import CATEGORIES
 
 
 # ----------------------------
 # Utils
 # ----------------------------
-
-
-def save_jsonl(path: Path, record: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def extract_points(canvas_json: dict) -> List[Tuple[float, float]]:
-    if not canvas_json:
-        return []
-    objs = canvas_json.get("objects", [])
-    pts: List[Tuple[float, float]] = []
-    for o in objs:
-        left = float(o.get("left", 0.0))
-        top = float(o.get("top", 0.0))
-        r = float(o.get("radius", 4.0))
-        pts.append((left + r, top + r))
-    return pts
 
 
 def _default_detection_cfg() -> dict:
@@ -119,11 +86,6 @@ def yolo_label_maps(cfg: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
     return en_to_ro, en_to_en
 
 
-@st.cache_resource(show_spinner=False)
-def get_clip_classifier(cfg: ClipConfig) -> ClipClassifier:
-    return ClipClassifier(cfg)
-
-
 # ----------------------------
 # UI
 # ----------------------------
@@ -138,9 +100,52 @@ yolo_cfg_data = load_yolo_world_config(config_path)
 prompt_classes_en = yolo_class_prompts_en(yolo_cfg_data)
 en_to_ro_label, _ = yolo_label_maps(yolo_cfg_data)
 
+loop_sim: bool = True  # default; overridden in sidebar when simulate-live is selected
+
 with st.sidebar:
-    st.header("Inputs")
-    uploaded = st.file_uploader("Upload runway video", type=["mp4", "mov", "mkv", "avi"])
+    st.header("Video Source")
+    source_mode = st.radio(
+        "Source type",
+        options=["Upload file", "Live — webcam", "Live — RTSP/URL", "Simulate live (file)"],
+        index=0,
+        help=(
+            "Upload file: process offline video.\n"
+            "Live — webcam: use a connected camera.\n"
+            "Live — RTSP/URL: use a network stream.\n"
+            "Simulate live (file): replay file at real-time pace, looping infinitely."
+        ),
+    )
+
+    uploaded = None
+    live_webcam_idx = 0
+    live_rtsp_url = ""
+    live_file_path = ""
+
+    if source_mode == "Upload file":
+        uploaded = st.file_uploader("Upload runway video", type=["mp4", "mov", "mkv", "avi"])
+    elif source_mode == "Live — webcam":
+        live_webcam_idx = st.number_input("Camera index", min_value=0, max_value=10, value=0, step=1)
+    elif source_mode == "Live — RTSP/URL":
+        live_rtsp_url = st.text_input("Stream URL", placeholder="rtsp://user:pass@192.168.1.10/stream")
+    else:  # Simulate live (file)
+        sim_uploaded = st.file_uploader("Upload video to simulate live", type=["mp4", "mov", "mkv", "avi"],
+                                        key="sim_upload")
+        loop_sim = st.checkbox("Loop infinitely", value=True)
+        if sim_uploaded is not None:
+            _sim_id = f"{sim_uploaded.name}_{sim_uploaded.size}"
+            if (st.session_state.get("_sim_upload_id") != _sim_id
+                    or not Path(st.session_state.get("_sim_upload_path", "")).exists()):
+                art_tmp = Path("artifacts/tmp")
+                art_tmp.mkdir(parents=True, exist_ok=True)
+                suffix = Path(sim_uploaded.name).suffix.lower()
+                if suffix not in {".mp4", ".mov", ".mkv", ".avi"}:
+                    suffix = ".mp4"
+                _sim_path = str(art_tmp / f"sim_{int(time.time()*1000)}{suffix}")
+                with open(_sim_path, "wb") as _f:
+                    _f.write(sim_uploaded.getbuffer())
+                st.session_state["_sim_upload_id"] = _sim_id
+                st.session_state["_sim_upload_path"] = _sim_path
+            live_file_path = st.session_state.get("_sim_upload_path", "")
 
     st.header("Performance")
     proc_width = st.select_slider("Processing width (px)", options=[640, 800, 960, 1120, 1280], value=960)
@@ -176,7 +181,6 @@ with st.sidebar:
     if enable_vlm:
         st.caption("Uses OpenCLIP (zero-shot). First run downloads ~400MB weights once.")
         vlm_model = st.selectbox("CLIP model", ["ViT-B-32", "ViT-L-14"], index=0)
-        # pretrained tags depend on model; keep one stable default per choice.
         vlm_pretrained = st.selectbox(
             "Pretrained weights",
             ["laion2b_s34b_b79k", "laion2b_s32b_b82k"],
@@ -196,30 +200,98 @@ with st.sidebar:
     run_btn = st.button("▶ Start", type="primary")
 
 
-if uploaded is None:
-    st.info("Upload a runway video to begin.")
-    st.stop()
+# ----------------------------
+# Resolve video source + first-frame probe (cached per source in session_state)
+# Caching avoids re-opening webcam/RTSP on every sidebar widget interaction
+# and prevents duplicate temp files for uploaded videos.
+# ----------------------------
 
-# Save upload to artifacts/tmp preserving extension
-art_tmp = Path("artifacts/tmp")
-art_tmp.mkdir(parents=True, exist_ok=True)
+_source_str: str = ""
+_source_mode_key: str = "file"
 
-suffix = Path(uploaded.name).suffix.lower()
-if suffix not in {".mp4", ".mov", ".mkv", ".avi"}:
-    suffix = ".mp4"
+if source_mode == "Upload file":
+    if uploaded is None:
+        st.info("Upload a runway video to begin.")
+        st.stop()
+    _upload_id = f"{uploaded.name}_{uploaded.size}"
+    if (st.session_state.get("_upload_id") != _upload_id
+            or not Path(st.session_state.get("_upload_path", "")).exists()):
+        art_tmp = Path("artifacts/tmp")
+        art_tmp.mkdir(parents=True, exist_ok=True)
+        suffix = Path(uploaded.name).suffix.lower()
+        if suffix not in {".mp4", ".mov", ".mkv", ".avi"}:
+            suffix = ".mp4"
+        _path = str(art_tmp / f"upload_{int(time.time()*1000)}{suffix}")
+        with open(_path, "wb") as _f:
+            _f.write(uploaded.getbuffer())
+        _cap = cv2.VideoCapture(_path)
+        _ok, _raw = _cap.read()
+        _cap.release()
+        if not _ok or _raw is None:
+            st.error("Could not read first frame from the uploaded video.")
+            st.stop()
+        st.session_state["_upload_id"] = _upload_id
+        st.session_state["_upload_path"] = _path
+        st.session_state["_upload_frame"] = _raw
+    _source_str = st.session_state["_upload_path"]
+    _first_frame_raw = st.session_state["_upload_frame"]
+    _source_mode_key = "file"
 
-video_path = art_tmp / f"upload_{int(time.time()*1000)}{suffix}"
-with open(video_path, "wb") as f:
-    f.write(uploaded.getbuffer())
+elif source_mode == "Live — webcam":
+    _source_str = str(int(live_webcam_idx))
+    _source_mode_key = "webcam"
+    _probe_key = f"_probe_webcam_{_source_str}"
+    if _probe_key not in st.session_state:
+        _cap = cv2.VideoCapture(int(_source_str))
+        _ok, _raw = _cap.read()
+        _cap.release()
+        if not _ok or _raw is None:
+            st.error(f"Could not read from camera index {_source_str}. Check the camera.")
+            st.stop()
+        st.session_state[_probe_key] = _raw
+    _first_frame_raw = st.session_state[_probe_key]
 
-cap = cv2.VideoCapture(str(video_path))
-ok, first = cap.read()
-if not ok:
-    st.error("Could not read the video file.")
-    st.stop()
+elif source_mode == "Live — RTSP/URL":
+    if not live_rtsp_url.strip():
+        st.info("Enter a stream URL to begin.")
+        st.stop()
+    _source_str = live_rtsp_url.strip()
+    _source_mode_key = "rtsp"
+    _probe_key = f"_probe_rtsp_{_source_str}"
+    if _probe_key not in st.session_state:
+        _cap = cv2.VideoCapture(_source_str)
+        _ok, _raw = _cap.read()
+        _cap.release()
+        if not _ok or _raw is None:
+            st.error("Could not read first frame from the stream. Check the URL.")
+            st.stop()
+        st.session_state[_probe_key] = _raw
+    _first_frame_raw = st.session_state[_probe_key]
 
-first = resize_keep_aspect(first, target_width=int(proc_width))
-frame_h, frame_w = first.shape[:2]
+else:  # Simulate live
+    if not live_file_path:
+        st.info("Upload a video to simulate live stream.")
+        st.stop()
+    _source_str = live_file_path
+    _source_mode_key = "file_live"
+    _probe_key = f"_probe_sim_{_source_str}"
+    if _probe_key not in st.session_state:
+        _cap = cv2.VideoCapture(_source_str)
+        _ok, _raw = _cap.read()
+        _cap.release()
+        if not _ok or _raw is None:
+            st.error("Could not read first frame from the simulated video.")
+            st.stop()
+        st.session_state[_probe_key] = _raw
+    _first_frame_raw = st.session_state[_probe_key]
+
+_first_frame = resize_keep_aspect(_first_frame_raw, target_width=int(proc_width))
+frame_h, frame_w = _first_frame.shape[:2]
+
+
+# ----------------------------
+# Polygon definition UI
+# ----------------------------
 
 st.subheader("1) Define runway zone")
 st.write("Define the runway polygon (minimum 3 points). Then press Start.")
@@ -228,8 +300,8 @@ colA, colB = st.columns([1.2, 0.8], gap="large")
 
 with colA:
     st.image(
-        Image.fromarray(cv2.cvtColor(first, cv2.COLOR_BGR2RGB)),
-        caption="First frame (enter runway points on the right)",
+        Image.fromarray(cv2.cvtColor(_first_frame, cv2.COLOR_BGR2RGB)),
+        caption="First frame — enter runway points on the right",
         use_container_width=True,
     )
 
@@ -238,7 +310,6 @@ poly_points: List[Tuple[float, float]] = []
 with colB:
     st.markdown("### Polygon points")
     st.caption(
-        "This build avoids the canvas dependency (which often breaks across Streamlit versions). "
         "Enter points manually or use the rectangle helper below."
     )
 
@@ -254,11 +325,12 @@ with colB:
             st.error("Rectangle invalid: y_max must be > y_min")
         else:
             poly_points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
     manual = st.text_area(
         "Manual points (one per line: x,y)",
         value="",
         placeholder="Example:\n120.5, 340.2\n980.0, 360.0\n900.0, 620.0\n150.0, 600.0",
-        help="If canvas doesn't work, paste points here.",
+        help="Paste coordinate pairs, one per line.",
     )
 
     if manual.strip():
@@ -278,11 +350,11 @@ with colB:
             poly_points = parsed
 
     if len(poly_points) >= 3:
-        preview = first.copy()
-        pts = np.array(poly_points, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.polylines(preview, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-        for (x, y) in poly_points:
-            cv2.circle(preview, (int(x), int(y)), 4, (0, 255, 0), -1)
+        preview = _first_frame.copy()
+        pts_arr = np.array(poly_points, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(preview, [pts_arr], isClosed=True, color=(0, 255, 0), thickness=2)
+        for (px, py) in poly_points:
+            cv2.circle(preview, (int(px), int(py)), 4, (0, 255, 0), -1)
         st.image(
             Image.fromarray(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)),
             caption="Runway polygon preview",
@@ -294,13 +366,14 @@ with colB:
     else:
         st.success(f"{len(poly_points)} points captured.")
 
-    st.dataframe(pd.DataFrame(poly_points, columns=["x", "y"]).round(1), use_container_width=True, height=220)
+    st.dataframe(pd.DataFrame(poly_points, columns=["x", "y"]).round(1),
+                 use_container_width=True, height=220)
 
     st.markdown("### YOLO classes (RO)")
     st.write(", ".join([en_to_ro_label.get(c, c) for c in prompt_classes_en]))
-
     st.markdown("### VLM categories")
     st.write(", ".join(CATEGORIES))
+
 
 if not run_btn:
     st.stop()
@@ -313,241 +386,135 @@ if int(confirm_n) > int(window_m):
     st.error("Confirm N must be <= Window M (otherwise no incident can ever open).")
     st.stop()
 
-# Stabilize polygon ordering
-poly_points = sort_polygon_points(poly_points)
-poly = polygon_from_points(poly_points)
-runway_mask = make_runway_mask(first.shape, poly)
 
-# Reset capture
-cap.release()
-cap = cv2.VideoCapture(str(video_path))
+# ----------------------------
+# Build runtime config
+# ----------------------------
 
-src_fps = cap.get(cv2.CAP_PROP_FPS)
-if not src_fps or math.isnan(src_fps) or src_fps <= 0:
-    src_fps = 30.0
+_loop_flag = True
+if _source_mode_key == "file_live":
+    # Only file_live has configureable loop; live sources always loop by nature
+    _loop_flag = loop_sim
 
-frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-frame_skip = max(1, int(round(src_fps / float(proc_fps))))
-
-effective_fps = int(proc_fps)
-
-# Components
-engine = IncidentEngine(confirm_n=int(confirm_n), window_m=int(window_m))
-
-yolo_pipeline = YoloWorldBoTSortPipeline(
-    YoloWorldConfig(
-        model_name=str(yolo_cfg_data["detection"]["model"]),
-        conf_threshold=float(yolo_conf),
-        iou_threshold=float(yolo_iou),
-        tracker_yaml=str(yolo_cfg_data["detection"].get("tracker_yaml", "botsort.yaml")),
-        classes_en=prompt_classes_en,
-    )
-)
-traj_predictor = TrajectoryPredictor(TrajectoryConfig(horizon_frames=int(horizon_frames)))
-
-prebuffer_frames = max(1, int(float(prebuffer_secs) * effective_fps))
-postbuffer_frames = max(1, int(float(postbuffer_secs) * effective_fps))
-
-rec = RecorderManager(
-    RecorderConfig(
-        fps=effective_fps,
-        frame_size=(frame_w, frame_h),
-        prebuffer_frames=prebuffer_frames,
-        postbuffer_frames=postbuffer_frames,
-    )
+runtime_cfg = RuntimeConfig(
+    source=_source_str,
+    source_mode=_source_mode_key,
+    loop=_loop_flag,
+    proc_width=int(proc_width),
+    proc_fps=int(proc_fps),
+    warmup_secs=float(warmup_secs),
+    confirm_n=int(confirm_n),
+    window_m=int(window_m),
+    yolo_model=str(yolo_cfg_data["detection"]["model"]),
+    yolo_conf=float(yolo_conf),
+    yolo_iou=float(yolo_iou),
+    yolo_tracker_yaml=str(yolo_cfg_data["detection"].get("tracker_yaml", "botsort.yaml")),
+    yolo_classes_en=prompt_classes_en,
+    horizon_frames=int(horizon_frames),
+    prebuffer_secs=float(prebuffer_secs),
+    postbuffer_secs=float(postbuffer_secs),
+    enable_vlm=bool(enable_vlm),
+    vlm_model=str(vlm_model),
+    vlm_pretrained=str(vlm_pretrained),
+    vlm_device=str(vlm_device),
+    vlm_frames=int(vlm_frames),
+    vlm_unknown_threshold=float(unknown_thr),
+    vlm_shadow_threshold=float(shadow_thr),
+    vlm_debris_detail_threshold=float(debris_detail_thr),
+    output_dir="artifacts",
 )
 
-warmup_frames = max(0, int(float(warmup_secs) * effective_fps))
 
-clip_cfg = ClipConfig(
-    enabled=bool(enable_vlm),
-    model_name=str(vlm_model),
-    pretrained=str(vlm_pretrained),
-    device=str(vlm_device),
-    unknown_threshold=float(unknown_thr),
-    shadow_artifact_threshold=float(shadow_thr),
-    debris_detail_threshold=float(debris_detail_thr),
-)
+# ----------------------------
+# Build RunwayShieldRuntime
+# ----------------------------
 
-clip_classifier = get_clip_classifier(clip_cfg) if enable_vlm else None
+try:
+    runtime = RunwayShieldRuntime(runtime_cfg, poly_points=poly_points)
+except (RuntimeError, ValueError) as _e:
+    st.error(f"Failed to initialise detection runtime: {_e}")
+    st.stop()
 
-# Logging
-art_dir = ensure_artifacts_dir()
-log_path = art_dir / "incidents.jsonl"
-save_jsonl(log_path, {"event": "RUN_START", "video": str(video_path), "ts": time.time()})
+frame_count = runtime.frame_count  # 0 for live sources
 
-# UI placeholders
+# ----------------------------
+# Processing UI placeholders
+# ----------------------------
+
 st.subheader("2) Processing")
+
+_is_live = _source_mode_key in ("webcam", "rtsp", "file_live")
+
+if _is_live:
+    st.info(
+        f"Live mode: **{source_mode}**. "
+        "Processing runs until you stop the app or close the browser tab."
+    )
+
 video_ph = st.empty()
 stats_ph = st.empty()
 inc_ph = st.empty()
-progress = st.progress(0.0)
 
-processed = 0
-frame_idx = 0
+if not _is_live:
+    progress = st.progress(0.0)
+else:
+    progress = None
+
 alerts_count = 0
-
-# warmup uses processed frame counter
-
 t0 = time.time()
+_frame_idx = 0  # raw frame counter for progress (file mode only)
 
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
+# ----------------------------
+# Main processing loop
+# ----------------------------
 
-    if frame_idx % frame_skip != 0:
-        frame_idx += 1
-        continue
+for result in runtime.run():
+    # Track raw frame index for progress bar (file mode)
+    _frame_idx += runtime.frame_skip
 
-    frame = resize_keep_aspect(frame, target_width=int(proc_width))
-    if frame.shape[0] != frame_h or frame.shape[1] != frame_w:
-        frame = cv2.resize(frame, (frame_w, frame_h), interpolation=cv2.INTER_AREA)
+    # Draw overlay using stored last-frame state in runtime
+    overlay = runtime.get_last_overlay(en_to_ro_label=en_to_ro_label)
+    if overlay is not None:
+        rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        video_ph.image(rgb, channels="RGB",
+                       caption=f"Frame {result.frame_index} | FPS {result.effective_fps:.1f}")
 
-    rec.push_frame(frame)
-
-    # Warmup
-    if processed < warmup_frames:
-        tracked_objects: List[TrackedObject] = []
-    else:
-        tracked_objects = yolo_pipeline.infer_and_track(frame)
-
-    trajectory_map = traj_predictor.update_and_predict(tracked_objects)
-
-    seen_tids: List[int] = []
-    for obj in tracked_objects:
-        x1, y1, x2, y2 = clamp_bbox(obj.bbox_xyxy, frame_w, frame_h)
-        cx, cy = bbox_center((x1, y1, x2, y2))
-        in_runway_now = point_in_polygon(poly, cx, cy)
-
-        pred = trajectory_map.get(int(obj.track_id))
-        future_points = pred.future_points if pred is not None else []
-        will_enter_runway = any(point_in_polygon(poly, px, py) for px, py in future_points)
-
-        if not in_runway_now and not will_enter_runway:
-            continue
-
-        seen_tids.append(int(obj.track_id))
-        engine.on_detection(
-            track_id=int(obj.track_id),
-            in_runway=bool(in_runway_now or will_enter_runway),
-            bbox_xyxy=(x1, y1, x2, y2),
-            conf=float(obj.confidence),
-            detector_label=str(obj.class_name),
-            predicted_intrusion=bool(will_enter_runway and not in_runway_now),
-            predicted_points=future_points,
-            trajectory_horizon=int(horizon_frames),
-        )
-
-    engine.update_tracks(seen_tids)
-
-    new_incidents = []
-    if processed >= warmup_frames:
-        new_incidents = engine.maybe_open_incidents(
-            frame_idx=processed,
-            poly_points=poly_points,
-            bbox_center_fn=bbox_center,
-            recorder=rec,
-            frame_bgr=frame,
-        )
-
-    # VLM classify immediately (fast) on incident open
-    for inc in new_incidents:
+    # Toast on new incidents
+    for inc in result.new_incidents:
         alerts_count += 1
-        st.toast(f"🚨 Incident opened: {inc.incident_id}", icon="🚨")
-        save_jsonl(log_path, {"event": "INCIDENT_OPEN", "ts": time.time(), "incident_id": inc.incident_id})
+        st.toast(f"🚨 Incident: {inc.incident_id} [{inc.severity}]", icon="🚨")
+        if inc.vlm_category and inc.vlm_category != "unknown":
+            status_icon = "✅" if inc.status == "DISMISSED" else "🧠"
+            st.toast(
+                f"{status_icon} {inc.vlm_category} "
+                f"({inc.vlm_confidence:.2f}) — {inc.status}",
+                icon=status_icon,
+            )
 
-        if clip_classifier is not None:
-            # sample 1..vlm_frames from prebuffer + current
-            rois: List[np.ndarray] = []
-            prebuf = list(rec.prebuffer)
-            k = int(vlm_frames)
-            if k > 1 and len(prebuf) > 1:
-                idxs = np.linspace(0, len(prebuf) - 1, num=k - 1).round().astype(int).tolist()
-                for idx in idxs:
-                    rois.append(crop_roi(prebuf[idx], inc.bbox_xyxy, pad=0.20))
-            rois.append(crop_roi(frame, inc.bbox_xyxy, pad=0.20))
+    inc_ph.dataframe(runtime.incidents_table(), use_container_width=True, height=300)
 
-            res = clip_classifier.classify_rois(rois)
-            inc.vlm_processed_ts = time.time()
-            inc.vlm_category = res.category
-            inc.vlm_detail = res.detail
-            inc.vlm_real = bool(res.real)
-            inc.vlm_confidence = float(res.confidence)
-            inc.vlm_error = res.error
-
-            # refine severity
-            cx, cy = bbox_center(inc.bbox_xyxy)
-            dist = normalized_across_runway_distance((cx, cy), poly_points)
-            inc.severity = severity_for(res.category, in_centerline=(dist < 0.25))
-
-            if res.ok and (res.real is False):
-                inc.status = "DISMISSED"
-                st.toast(f"✅ Dismissed as artefact: {res.category} ({res.confidence:.2f})", icon="✅")
-                save_jsonl(log_path, {"event": "INCIDENT_DISMISSED", "ts": time.time(), "incident_id": inc.incident_id, "category": res.category, "conf": res.confidence})
-            else:
-                label = res.detail or res.category
-                st.toast(f"🧠 Classified: {label} ({res.confidence:.2f}) on {clip_classifier.device}", icon="🧠")
-                save_jsonl(log_path, {"event": "INCIDENT_CLASSIFIED", "ts": time.time(), "incident_id": inc.incident_id, "category": res.category, "detail": res.detail, "conf": res.confidence, "real": res.real})
-
-    # Overlay
-    overlay = frame.copy()
-    cv2.polylines(overlay, [poly], isClosed=True, color=(0, 255, 0), thickness=2)
-
-    for obj in tracked_objects:
-        x1, y1, x2, y2 = clamp_bbox(obj.bbox_xyxy, frame_w, frame_h)
-        cx, cy = bbox_center((x1, y1, x2, y2))
-        pred = trajectory_map.get(int(obj.track_id))
-        future_points = pred.future_points if pred is not None else []
-        in_runway_now = point_in_polygon(poly, cx, cy)
-        will_enter_runway = any(point_in_polygon(poly, px, py) for px, py in future_points)
-        if not in_runway_now and not will_enter_runway:
-            continue
-        box_color = (0, 0, 255) if in_runway_now else (0, 255, 255)
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), box_color, 2)
-        label_ro = en_to_ro_label.get(obj.class_name, obj.class_name)
-        cv2.putText(
-            overlay,
-            f"id#{obj.track_id} {label_ro} {obj.confidence:.2f}",
-            (x1, max(0, y1 - 7)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            box_color,
-            2,
-            cv2.LINE_AA,
-        )
-
-        if future_points:
-            for px, py in future_points:
-                cv2.circle(overlay, (int(px), int(py)), 2, (255, 200, 0), -1)
-            pts = np.array([[int(px), int(py)] for px, py in future_points], dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(overlay, [pts], isClosed=False, color=(255, 200, 0), thickness=2)
-
-    rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-    video_ph.image(rgb, channels="RGB", caption=f"Processed frame {processed}")
-
-    inc_ph.dataframe(engine.to_table(), use_container_width=True, height=300)
-
-    processed += 1
     elapsed = time.time() - t0
-    fps_eff = processed / max(1e-6, elapsed)
+    fps_eff = result.effective_fps
+    source_fps_label = f"{runtime.source_fps:.1f}" if not _is_live else "live"
 
     stats_ph.markdown(
         f"""
-        **Stats**  
-        - Source FPS: `{src_fps:.1f}` | Target FPS: `{proc_fps}` | Effective FPS: `{fps_eff:.1f}`  
-        - Frame skip: `{frame_skip}` | Processed frames: `{processed}`  
-        - Incidents opened: `{alerts_count}`  
-        - Log: `{log_path}`
+        **Stats**
+        - Source: `{source_mode}` | Source FPS: `{source_fps_label}` | Effective FPS: `{fps_eff:.1f}`
+        - Processed frames: `{result.frame_index}` | In-runway tracks: `{result.tracked_count}`
+        - Incidents opened: `{alerts_count}` | Elapsed: `{elapsed:.0f}s`
+        - Log: `artifacts/incidents.jsonl`
         """
     )
 
-    if frame_count > 0:
-        progress.progress(min(1.0, frame_idx / frame_count))
+    if progress is not None and frame_count > 0:
+        progress.progress(min(1.0, _frame_idx / frame_count))
 
-    frame_idx += 1
+runtime.shutdown()
 
-cap.release()
-save_jsonl(log_path, {"event": "RUN_END", "ts": time.time(), "processed_frames": processed, "incidents": alerts_count})
+if not _is_live:
+    st.success(
+        "Done. Check `artifacts/` for evidence clips + snapshots, "
+        "and `artifacts/incidents.jsonl` for the audit log."
+    )
 
-st.success("Done. Check `artifacts/` for evidence clips + snapshots, and `artifacts/incidents.jsonl` for the audit log.")
