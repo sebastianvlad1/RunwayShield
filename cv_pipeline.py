@@ -12,6 +12,7 @@ This module has no ML dependencies and is deterministic.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -19,6 +20,8 @@ from collections import defaultdict, deque
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger("runway_shield")
 
 
 # ----------------------------
@@ -301,6 +304,7 @@ class YoloWorldConfig:
     iou_threshold: float = 0.50
     tracker_yaml: str = "botsort.yaml"
     classes_en: Optional[List[str]] = None
+    device: str = "auto"  # "auto" | "cpu" | "cuda" | "0"
 
 
 @dataclass
@@ -473,6 +477,18 @@ class YoloWorldBoTSortPipeline:
         self._class_names: List[str] = []
         self._init_model()
 
+    def _resolve_device(self) -> str:
+        dev = self.cfg.device
+        if dev == "auto":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return "0"
+            except Exception as exc:
+                logger.warning("[yolo] CUDA check failed (%s) — falling back to cpu", exc)
+            return "cpu"
+        return dev
+
     def _init_model(self) -> None:
         try:
             from ultralytics import YOLO
@@ -481,6 +497,7 @@ class YoloWorldBoTSortPipeline:
                 "ultralytics is required for YOLO-World + BoT-SORT. Install `ultralytics`."
             ) from e
 
+        self._device: str = self._resolve_device()
         self._model = YOLO(self.cfg.model_name)
 
         classes = list(self.cfg.classes_en or [])
@@ -488,6 +505,9 @@ class YoloWorldBoTSortPipeline:
             # YOLO-World text prompts; the model performs open-vocabulary detection.
             self._model.set_classes(classes)
             self._class_names = classes
+
+        logger.info("[yolo] model=%s  device=%s  classes=%s",
+                    self.cfg.model_name, self._device, self._class_names or "(all)")
 
     def infer_and_track(self, frame_bgr: np.ndarray) -> List[TrackedObject]:
         if self._model is None:
@@ -498,6 +518,7 @@ class YoloWorldBoTSortPipeline:
             conf=float(self.cfg.conf_threshold),
             iou=float(self.cfg.iou_threshold),
             tracker=str(self.cfg.tracker_yaml),
+            device=self._device,
             persist=True,
             verbose=False,
         )

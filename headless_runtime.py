@@ -93,6 +93,7 @@ class RuntimeConfig:
     yolo_iou: float = 0.50
     yolo_tracker_yaml: str = "botsort.yaml"
     yolo_classes_en: List[str] = field(default_factory=list)
+    yolo_device: str = "auto"  # "auto" | "cpu" | "cuda" | "0"
 
     # --- Trajectory ---
     horizon_frames: int = 10
@@ -370,8 +371,17 @@ class RunwayShieldRuntime:
                 iou_threshold=cfg.yolo_iou,
                 tracker_yaml=cfg.yolo_tracker_yaml,
                 classes_en=cfg.yolo_classes_en,
+                device=cfg.yolo_device,
             )
         )
+        logger.info("[runtime] detection device: %s", self._yolo._device)
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         # Trajectory predictor
         self._traj = TrajectoryPredictor(TrajectoryConfig(horizon_frames=cfg.horizon_frames))
@@ -437,6 +447,22 @@ class RunwayShieldRuntime:
     @property
     def frame_count(self) -> int:
         return self._video.frame_count
+
+    @property
+    def device_info(self) -> dict:
+        """Return device info for display (detection device, VLM device, GPU mem MB)."""
+        info = {
+            "detection": getattr(self._yolo, "_device", "unknown"),
+            "vlm": self._clip.device if self._clip else "n/a",
+            "gpu_mem_mb": 0,
+        }
+        try:
+            import torch
+            if torch.cuda.is_available():
+                info["gpu_mem_mb"] = round(torch.cuda.memory_allocated() / 1024 ** 2)
+        except Exception:
+            pass
+        return info
 
     # -- stop signal --
 
