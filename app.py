@@ -496,6 +496,8 @@ for result in runtime.run():
     elapsed = time.time() - t0
     fps_eff = result.effective_fps
     source_fps_label = f"{runtime.source_fps:.1f}" if not _is_live else "live"
+    _dev = runtime.device_info
+    _gpu_label = f" | GPU mem: `{_dev['gpu_mem_mb']} MB`" if _dev['gpu_mem_mb'] > 0 else ""
 
     stats_ph.markdown(
         f"""
@@ -503,6 +505,7 @@ for result in runtime.run():
         - Source: `{source_mode}` | Source FPS: `{source_fps_label}` | Effective FPS: `{fps_eff:.1f}`
         - Processed frames: `{result.frame_index}` | In-runway tracks: `{result.tracked_count}`
         - Incidents opened: `{alerts_count}` | Elapsed: `{elapsed:.0f}s`
+        - Detection device: `{_dev['detection']}` | VLM device: `{_dev['vlm']}`{_gpu_label}
         - Log: `artifacts/incidents.jsonl`
         """
     )

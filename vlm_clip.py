@@ -13,11 +13,14 @@ OpenCLIP is open-source and widely used for zero-shot classification.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import cv2
+
+logger = logging.getLogger("runway_shield")
 
 
 @dataclass
@@ -115,10 +118,14 @@ def _choose_device(pref: str) -> str:
         if pref == "cpu":
             return "cpu"
         if pref == "cuda":
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                return "cuda"
+            logger.warning("CLIP: CUDA requested but not available, falling back to CPU")
+            return "cpu"
         if pref == "mps":
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 return "mps"
+            logger.warning("CLIP: MPS requested but not available, falling back to CPU")
             return "cpu"
         # auto
         if torch.cuda.is_available():
@@ -126,7 +133,8 @@ def _choose_device(pref: str) -> str:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return "mps"
         return "cpu"
-    except Exception:
+    except Exception as exc:
+        logger.warning("CLIP: device detection failed (%s), falling back to CPU", exc)
         return "cpu"
 
 
@@ -173,6 +181,12 @@ class ClipClassifier:
         )
         model.eval()
 
+        # Use half-precision on CUDA for faster inference
+        if device == "cuda":
+            model = model.half()
+
+        logger.info("CLIP device: %s (half=%s, model=%s)", device, device == "cuda", self.cfg.model_name)
+
         # Build category text embeddings
         cat_prompts: List[str] = []
         cat_offsets: List[Tuple[int, int]] = []
@@ -186,7 +200,12 @@ class ClipClassifier:
         tokenizer = open_clip.get_tokenizer(self.cfg.model_name)
         text = tokenizer(cat_prompts)
 
-        with torch.inference_mode():
+        autocast_ctx = (
+            torch.amp.autocast(device_type="cuda")
+            if device == "cuda"
+            else torch.inference_mode()
+        )
+        with torch.inference_mode(), autocast_ctx:
             text = text.to(device)
             text_emb = model.encode_text(text)
             text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
@@ -212,7 +231,7 @@ class ClipClassifier:
 
         text2 = tokenizer(detail_prompts) if detail_prompts else None
         if text2 is not None:
-            with torch.inference_mode():
+            with torch.inference_mode(), autocast_ctx:
                 text2 = text2.to(device)
                 detail_emb = model.encode_text(text2)
                 detail_emb = detail_emb / detail_emb.norm(dim=-1, keepdim=True)
@@ -251,7 +270,12 @@ class ClipClassifier:
 
             imgs = torch.stack([self._preprocess(im) for im in pil_imgs], dim=0).to(self._device)
 
-            with torch.inference_mode():
+            autocast_ctx = (
+                torch.amp.autocast(device_type="cuda")
+                if self._device == "cuda"
+                else torch.inference_mode()
+            )
+            with torch.inference_mode(), autocast_ctx:
                 img_emb = self._model.encode_image(imgs)
                 img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
 
@@ -276,7 +300,7 @@ class ClipClassifier:
 
             detail: Optional[str] = None
             if best_cat == "debris" and best_conf >= float(self.cfg.debris_detail_threshold) and self._detail_text_emb is not None:
-                with torch.inference_mode():
+                with torch.inference_mode(), autocast_ctx:
                     logits2 = (img_emb @ self._detail_text_emb.T) * 100.0
                     probs2 = logits2.softmax(dim=-1).squeeze(0)
                 probs2_np = probs2.detach().float().cpu().numpy()

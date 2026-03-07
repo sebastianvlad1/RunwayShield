@@ -12,6 +12,7 @@ This module has no ML dependencies and is deterministic.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -19,6 +20,8 @@ from collections import defaultdict, deque
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger("runway_shield")
 
 
 # ----------------------------
@@ -500,11 +503,21 @@ class GroundingDINOPipeline:
 
         self._processor = AutoProcessor.from_pretrained(self.cfg.model_name)
 
-        dtype = torch.float16 if self._device == "cuda" else torch.float32
         self._model = AutoModelForZeroShotObjectDetection.from_pretrained(
-            self.cfg.model_name, dtype=dtype
+            self.cfg.model_name
         ).to(self._device)
+        # Convert to half-precision after moving to CUDA — avoids torch_dtype/dtype
+        # kwarg incompatibility across transformers versions (4.x vs 5.x).
+        if self._device == "cuda":
+            self._model = self._model.half()
+            self._dtype = torch.float16
+        else:
+            self._dtype = torch.float32
         self._model.eval()
+
+        logger.info("GroundingDINO device: %s (dtype: %s)", self._device, self._dtype)
+        if self._device == "cuda":
+            logger.info("GroundingDINO GPU memory: %.0f MB", torch.cuda.memory_allocated() / 1024**2)
 
         classes = list(self.cfg.classes_en or [])
         if classes:
@@ -521,10 +534,14 @@ class GroundingDINOPipeline:
         if pref == "cpu":
             return "cpu"
         if pref == "cuda":
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                return "cuda"
+            logger.warning("CUDA requested but not available, falling back to CPU")
+            return "cpu"
         if pref == "mps":
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 return "mps"
+            logger.warning("MPS requested but not available, falling back to CPU")
             return "cpu"
         # auto
         if torch.cuda.is_available():
@@ -547,7 +564,12 @@ class GroundingDINOPipeline:
             images=pil_img, text=self._text_prompt, return_tensors="pt"
         ).to(self._device)
 
-        with torch.no_grad():
+        autocast_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=self._dtype)
+            if self._device == "cuda"
+            else torch.no_grad()
+        )
+        with torch.no_grad(), autocast_ctx:
             outputs = self._model(**inputs)
 
         results = self._processor.post_process_grounded_object_detection(

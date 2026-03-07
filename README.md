@@ -28,6 +28,69 @@ python preflight.py
 python -m streamlit run app.py
 ```
 
+## GPU/CUDA setup (important)
+
+By default, `pip install torch` may install a CPU build depending on your environment.
+If you want NVIDIA GPU acceleration, install the CUDA build of PyTorch explicitly.
+
+### Windows + NVIDIA (recommended)
+```powershell
+py -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+
+# Install CUDA-enabled PyTorch first
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Install project deps
+python -m pip install -r requirements.txt
+
+# Verify
+python preflight.py
+```
+
+Expected preflight output on a GPU machine:
+```text
+[preflight] CUDA available: <GPU name> (<VRAM> MB VRAM)
+```
+
+### Quick runtime check
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+```
+
+### If Task Manager shows 0% GPU
+
+This app uses CUDA/compute engines, not 3D rendering.
+In Windows Task Manager, set the GPU graph to `Cuda` or `Compute_0`/`Compute_1`
+instead of `3D`, or check usage with `nvidia-smi`.
+
+### Expected processing speed
+
+GroundingDINO (the zero-shot detection backbone) is computationally heavy.
+Typical throughput on consumer GPUs:
+
+| GPU | FPS (GroundingDINO-tiny) |
+|-----|--------------------------|
+| GTX 1650 Ti (4 GB) | ~0.4 FPS |
+| RTX 3060 / 3070 | ~1–2 FPS |
+| RTX 4080 / A100 | ~4–8 FPS |
+
+This is expected. The app uses frame-skip gating so not every frame is analysed —
+configure `frame_skip` in `config.yaml` to trade coverage for UI responsiveness.
+
+> **Note:** `torch.compile()` acceleration is not available on Windows (requires Triton,
+> which is Linux-only). On Linux the speed roughly doubles.
+
+### Optional: HF token to avoid download/rate-limit warnings
+
+Set `HF_TOKEN` to reduce Hugging Face Hub rate-limit warnings and improve model download reliability.
+
+PowerShell example:
+```powershell
+$env:HF_TOKEN = "<your_token_here>"
+```
+
 ## How it works (high level)
 1. Upload a runway video.
 2. Define runway area by clicking points (polygon).

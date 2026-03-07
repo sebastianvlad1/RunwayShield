@@ -407,6 +407,19 @@ class RunwayShieldRuntime:
                 )
             )
 
+        # Log resolved devices and free transient CUDA allocations
+        self._detection_device = getattr(self._yolo, '_device', 'unknown')
+        self._vlm_device = self._clip.device if self._clip else 'n/a'
+        logger.info("Detection (GroundingDINO) running on: %s", self._detection_device)
+        if self._clip:
+            logger.info("VLM (CLIP) running on: %s", self._vlm_device)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
         self._warmup_frames = max(0, int(cfg.warmup_secs * effective_fps))
 
         # Push first frame into prebuffer
@@ -438,6 +451,22 @@ class RunwayShieldRuntime:
     @property
     def frame_count(self) -> int:
         return self._video.frame_count
+
+    @property
+    def device_info(self) -> dict:
+        """Return resolved device strings for detection and VLM models."""
+        info = {
+            "detection": getattr(self, '_detection_device', 'unknown'),
+            "vlm": getattr(self, '_vlm_device', 'n/a'),
+            "gpu_mem_mb": 0,
+        }
+        try:
+            import torch
+            if torch.cuda.is_available():
+                info["gpu_mem_mb"] = round(torch.cuda.memory_allocated() / 1024**2)
+        except Exception:
+            pass
+        return info
 
     # -- stop signal --
 

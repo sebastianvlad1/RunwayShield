@@ -3,7 +3,14 @@ opencv-python>=4.8
 numpy>=1.24
 pandas>=2.0
 pillow>=10.0
+# NOTE: For GPU/CUDA support, install PyTorch FIRST with:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Then install the rest: pip install -r requirements.txt
+# The line below is only used as a fallback / version check.
 torch>=2.1
 open_clip_torch>=2.24.0
-transformers>=4.40.0
+# transformers is pinned to 4.50.x — versions 4.51+ introduce GPU-CPU sync points
+# inside GroundingDINO's deformable attention (torch_compilable_check) that reduce
+# inference throughput from ~0.4 FPS to ~0.2 FPS on mid-range GPUs.
+transformers==4.50.3
 PyYAML>=6.0.1
