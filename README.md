@@ -118,14 +118,38 @@ All incidents are also written to `artifacts/incidents.jsonl`.
 python headless_runner.py --help
 ```
 
-Key flags:
-- `--source` — path / URL / camera index
-- `--mode` — `file` | `file_live` | `webcam` | `rtsp`
-- `--polygon` — path to JSON or YAML polygon file
-- `--proc-width` — processing width in pixels (default 960)
-- `--proc-fps` — target processing FPS (default 15)
-- `--confirm-n` / `--window-m` — N-of-M gating (default 6/10)
-- `--loop` — loop file infinitely in `file_live` mode
-- `--enable-vlm` — enable CLIP classification
-- `--reconnect-attempts` / `--reconnect-delay` — live stream reconnect settings
+| Flag | Default | Description |
+|---|---|---|
+| `--source` | **required** | Video path, webcam index (`0`), or RTSP URL |
+| `--polygon` | **required** | Path to polygon JSON or YAML file (min 3 points) |
+| `--mode` | `file` | `file` \| `file_live` \| `webcam` \| `rtsp` |
+| `--loop` | `False` | Loop file infinitely at EOF (only for `file_live`) |
+| `--output-dir` | `artifacts` | Directory for evidence clips, snapshots, and JSONL log |
+| `--verbose` | `False` | Enable DEBUG logging |
+| **Performance** | | |
+| `--proc-width` | `960` | Processing frame width in pixels |
+| `--proc-fps` | `15` | Target processing FPS (also controls `file_live` pacing) |
+| **Incident gating** | | |
+| `--confirm-n` | `6` | Frames a track must be in-runway to open an incident |
+| `--window-m` | `10` | Sliding window size for N-of-M gating |
+| `--warmup-secs` | `3.0` | Seconds to skip detection at startup (background stabilisation) |
+| **YOLO detection** | | |
+| `--yolo-conf` | `0.25` | YOLO confidence threshold (overrides `config.yaml`) |
+| `--yolo-iou` | `0.50` | YOLO IoU threshold (overrides `config.yaml`) |
+| `--horizon-frames` | `10` | Kalman trajectory prediction horizon (frames ahead) |
+| **Evidence buffers** | | |
+| `--prebuffer-secs` | `5.0` | Seconds of pre-incident video included in evidence clip |
+| `--postbuffer-secs` | `5.0` | Seconds of post-incident video included in evidence clip |
+| **VLM classification** | | |
+| `--enable-vlm` | `False` | Enable OpenCLIP classification of incident ROI |
+| `--vlm-model` | `ViT-B-32` | CLIP model (`ViT-B-32` or `ViT-L-14`) |
+| `--vlm-pretrained` | `laion2b_s34b_b79k` | Pretrained weights tag |
+| `--vlm-device` | `auto` | `auto` \| `cpu` \| `cuda` \| `mps` |
+| `--vlm-frames` | `3` | Number of ROI frames for temporal averaging |
+| `--vlm-unknown-threshold` | `0.28` | Below this confidence → category becomes `unknown` |
+| `--vlm-shadow-threshold` | `0.55` | Shadow confidence above this → `real=false`, incident dismissed |
+| `--vlm-debris-detail-threshold` | `0.45` | Min debris confidence to run sub-classification |
+| **Live source / reconnect** | | |
+| `--reconnect-attempts` | `10` | Max reconnect attempts for webcam/RTSP on failure |
+| `--reconnect-delay` | `1.0` | Base delay in seconds between reconnect attempts (doubles each time) |
 
