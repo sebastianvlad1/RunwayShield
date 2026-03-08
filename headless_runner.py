@@ -146,6 +146,9 @@ def _build_runtime_config(args: argparse.Namespace, detection_cfg: dict) -> Runt
         yolo_tracker_yaml=str(detection_cfg.get("tracker_yaml", "botsort.yaml")),
         yolo_classes_en=classes_en,
         horizon_frames=int(args.horizon_frames),
+        infer_width=int(args.infer_width),
+        dino_every=int(args.dino_every),
+        crop_pad_factor=float(args.crop_pad),
         prebuffer_secs=float(args.prebuffer_secs),
         postbuffer_secs=float(args.postbuffer_secs),
         enable_vlm=bool(args.enable_vlm),
@@ -214,17 +217,23 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Enable DEBUG logging.")
 
     perf = p.add_argument_group("Performance")
-    perf.add_argument("--proc-width", type=int, default=960,
+    perf.add_argument("--proc-width", type=int, default=640,
                       help="Processing frame width in pixels.")
-    perf.add_argument("--proc-fps", type=int, default=15,
+    perf.add_argument("--proc-fps", type=int, default=7,
                       help="Target processing FPS (file_live pacing).")
+    perf.add_argument("--infer-width", type=int, default=640,
+                      help="Resolution sent to GroundingDINO (separate from display).")
+    perf.add_argument("--dino-every", type=int, default=3,
+                      help="Run GroundingDINO once every N frames; Kalman in between.")
+    perf.add_argument("--crop-pad", type=float, default=0.20,
+                      help="Padding factor around runway bounding-rect for inference crop.")
 
     gating = p.add_argument_group("Incident gating")
     gating.add_argument("--confirm-n", type=int, default=6,
                         help="Frames track must be in-runway to open incident.")
     gating.add_argument("--window-m", type=int, default=10,
                         help="Sliding window size for N-of-M gating.")
-    gating.add_argument("--warmup-secs", type=float, default=3.0,
+    gating.add_argument("--warmup-secs", type=float, default=5.0,
                         help="Background warmup seconds before detection starts.")
 
     yolo = p.add_argument_group("Detection (GroundingDINO)")
@@ -235,11 +244,11 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Detection confidence threshold (overrides config.yaml).")
     yolo.add_argument("--yolo-iou", type=float, default=None,
                       help="Detection IoU threshold (overrides config.yaml).")
-    yolo.add_argument("--horizon-frames", type=int, default=10,
+    yolo.add_argument("--horizon-frames", type=int, default=6,
                       help="Kalman trajectory prediction horizon (frames).")
 
     ev = p.add_argument_group("Evidence buffers")
-    ev.add_argument("--prebuffer-secs", type=float, default=5.0,
+    ev.add_argument("--prebuffer-secs", type=float, default=3.0,
                     help="Seconds of pre-incident video to include in clip.")
     ev.add_argument("--postbuffer-secs", type=float, default=5.0,
                     help="Seconds of post-incident video to include in clip.")

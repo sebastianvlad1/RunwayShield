@@ -470,6 +470,49 @@ class TrajectoryPredictor:
                 out[int(tid)] = pred
         return out
 
+    def predict_only_step(
+        self, last_objects: List[TrackedObject]
+    ) -> Tuple[List[TrackedObject], Dict[int, TrajectoryPrediction]]:
+        """Advance Kalman state one step WITHOUT measurement update.
+
+        Used on frames where GroundingDINO is skipped (``dino_every``).
+        Does NOT call ``mark_missed`` so tracks stay alive.
+        Returns synthetic TrackedObjects + trajectory predictions.
+        """
+        objects: List[TrackedObject] = []
+        active: set[int] = set()
+        for obj in last_objects:
+            tid = int(obj.track_id)
+            if tid not in self._state:
+                continue
+            x_pred, p_pred = self._predict_only(self._state[tid], self._cov[tid])
+            self._state[tid] = x_pred
+            self._cov[tid] = p_pred
+            active.add(tid)
+
+            cx = float(x_pred[0, 0])
+            cy = float(x_pred[1, 0])
+            bw, bh = self._size_wh.get(tid, (32.0, 32.0))
+            x1 = int(round(cx - bw / 2))
+            y1 = int(round(cy - bh / 2))
+            x2 = int(round(cx + bw / 2))
+            y2 = int(round(cy + bh / 2))
+            objects.append(TrackedObject(
+                track_id=tid,
+                bbox_xyxy=(x1, y1, x2, y2),
+                confidence=obj.confidence,
+                class_name=obj.class_name,
+                class_id=obj.class_id,
+                centroid_xy=(cx, cy),
+            ))
+
+        traj_map: Dict[int, TrajectoryPrediction] = {}
+        for tid in active:
+            pred = self.predict_n(tid)
+            if pred is not None:
+                traj_map[tid] = pred
+        return objects, traj_map
+
 
 class GroundingDINOPipeline:
     """GroundingDINO detection + IoU tracking wrapper.

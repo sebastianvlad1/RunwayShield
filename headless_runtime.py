@@ -77,11 +77,11 @@ class RuntimeConfig:
     """Only used with source_mode='file_live'. Loop file infinitely."""
 
     # --- Frame sizing/rate ---
-    proc_width: int = 960
-    proc_fps: int = 15
+    proc_width: int = 640
+    proc_fps: int = 7
 
     # --- Warmup ---
-    warmup_secs: float = 3.0
+    warmup_secs: float = 5.0
 
     # --- Incident gating ---
     confirm_n: int = 6
@@ -96,10 +96,20 @@ class RuntimeConfig:
     yolo_classes_en: List[str] = field(default_factory=list)
 
     # --- Trajectory ---
-    horizon_frames: int = 10
+    horizon_frames: int = 6
+
+    # --- Inference optimisation ---
+    infer_width: int = 640
+    """Resolution sent to GroundingDINO (separate from display proc_width)."""
+
+    dino_every: int = 3
+    """Run GroundingDINO once every N processed frames; Kalman-predict in between."""
+
+    crop_pad_factor: float = 0.20
+    """Padding around runway bounding-rect before cropping for inference (fraction)."""
 
     # --- Evidence ---
-    prebuffer_secs: float = 5.0
+    prebuffer_secs: float = 3.0
     postbuffer_secs: float = 5.0
 
     # --- VLM ---
@@ -361,6 +371,19 @@ class RunwayShieldRuntime:
         # Build runway mask
         self._runway_mask = make_runway_mask(first.shape, self._poly)
 
+        # Compute padded bounding rect of runway polygon for inference crop.
+        bx, by, bw, bh = cv2.boundingRect(self._poly)
+        pad_x = int(round(bw * cfg.crop_pad_factor))
+        pad_y = int(round(bh * cfg.crop_pad_factor))
+        rx1 = max(0, bx - pad_x)
+        ry1 = max(0, by - pad_y)
+        rx2 = min(self._frame_w, bx + bw + pad_x)
+        ry2 = min(self._frame_h, by + bh + pad_y)
+        self._runway_crop_rect: Tuple[int, int, int, int] = (rx1, ry1, rx2, ry2)
+
+        # State for dino_every skip-frame logic
+        self._last_tracked_objects: List[TrackedObject] = []
+
         effective_fps = cfg.proc_fps
 
         # Detection pipeline (GroundingDINO + IoU tracker)
@@ -525,13 +548,64 @@ class RunwayShieldRuntime:
 
         self._rec.push_frame(frame)
         is_warmup = self._processed < self._warmup_frames
+        cfg = self._cfg
 
         if is_warmup:
+            # --- Branch C: warmup — no detection ---
             tracked_objects: List[TrackedObject] = []
-        else:
-            tracked_objects = self._yolo.infer_and_track(frame)
+            trajectory_map: dict = {}
 
-        trajectory_map = self._traj.update_and_predict(tracked_objects)
+        elif self._processed == self._warmup_frames or self._processed % cfg.dino_every == 0:
+            # --- Branch A: GroundingDINO inference frame ---
+            # Crop to padded runway bounding rect + optional downscale.
+            rx1, ry1, rx2, ry2 = self._runway_crop_rect
+            crop_w = rx2 - rx1
+            crop_h = ry2 - ry1
+
+            if crop_w >= 64 and crop_h >= 64:
+                crop = frame[ry1:ry2, rx1:rx2]
+                # Downscale only — never upscale.
+                scale = min(1.0, cfg.infer_width / float(crop_w))
+                if scale < 1.0:
+                    infer_h = int(round(crop_h * scale))
+                    infer_w = int(round(crop_w * scale))
+                    small = cv2.resize(crop, (infer_w, infer_h), interpolation=cv2.INTER_AREA)
+                else:
+                    small = crop
+                    scale = 1.0
+
+                raw_tracked = self._yolo.infer_and_track(small)
+
+                # Translate coordinates back to full-frame space.
+                tracked_objects = []
+                for obj in raw_tracked:
+                    ox1, oy1, ox2, oy2 = obj.bbox_xyxy
+                    ox1 = int(round(ox1 / scale)) + rx1
+                    oy1 = int(round(oy1 / scale)) + ry1
+                    ox2 = int(round(ox2 / scale)) + rx1
+                    oy2 = int(round(oy2 / scale)) + ry1
+                    cx = (ox1 + ox2) / 2.0
+                    cy = (oy1 + oy2) / 2.0
+                    tracked_objects.append(TrackedObject(
+                        track_id=obj.track_id,
+                        bbox_xyxy=(ox1, oy1, ox2, oy2),
+                        confidence=obj.confidence,
+                        class_name=obj.class_name,
+                        class_id=obj.class_id,
+                        centroid_xy=(cx, cy),
+                    ))
+            else:
+                # Crop too small — fall back to full frame inference.
+                tracked_objects = self._yolo.infer_and_track(frame)
+
+            trajectory_map = self._traj.update_and_predict(tracked_objects)
+            self._last_tracked_objects = tracked_objects
+
+        else:
+            # --- Branch B: Kalman-only frame (skip GroundingDINO) ---
+            tracked_objects, trajectory_map = self._traj.predict_only_step(
+                self._last_tracked_objects
+            )
 
         seen_tids: List[int] = []
         for obj in tracked_objects:

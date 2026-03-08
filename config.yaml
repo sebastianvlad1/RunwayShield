@@ -1,11 +1,11 @@
 detection:
   model: "IDEA-Research/grounding-dino-tiny"
-  conf_threshold: 0.25
-  iou_threshold: 0.50
+  conf_threshold: 0.35
+  iou_threshold: 0.60
   classes:
     - id: 0
-      ro: "persoana cu tricou alb"
-      en: "person with white t-shirt"
+      ro: "persoana purtand ochelari"
+      en: "person wearing glasses"
     - id: 1
       ro: "avion"
       en: "airplane"

@@ -27,8 +27,8 @@ from vlm_clip import CATEGORIES
 def _default_detection_cfg() -> dict:
     return {
         "model": "IDEA-Research/grounding-dino-tiny",
-        "conf_threshold": 0.25,
-        "iou_threshold": 0.5,
+        "conf_threshold": 0.35,
+        "iou_threshold": 0.6,
         "classes": [
             {"id": 0, "ro": "persoana cu rucsac", "en": "person with backpack"},
             {"id": 1, "ro": "vehicul de pista", "en": "runway vehicle"},
@@ -147,8 +147,8 @@ with st.sidebar:
             live_file_path = st.session_state.get("_sim_upload_path", "")
 
     st.header("Performance")
-    proc_width = st.select_slider("Processing width (px)", options=[640, 800, 960, 1120, 1280], value=960)
-    proc_fps = st.select_slider("Process FPS (approx)", options=[5, 10, 15, 20, 30], value=15)
+    proc_width = st.select_slider("Processing width (px)", options=[480, 640, 800, 960, 1120, 1280], value=640)
+    proc_fps = st.select_slider("Process FPS (approx)", options=[5, 7, 10, 15, 20, 30], value=7)
 
     st.header("Incident gating")
     window_m = st.number_input("Window M (frames)", min_value=5, max_value=120, value=10, step=1)
@@ -158,13 +158,13 @@ with st.sidebar:
     yolo_device = st.selectbox("Detection device", ["auto", "cpu", "cuda", "mps"], index=0)
     yolo_conf = st.slider("Detection confidence", 0.05, 0.95, float(yolo_cfg_data["detection"]["conf_threshold"]), 0.01)
     yolo_iou = st.slider("Detection IoU", 0.05, 0.95, float(yolo_cfg_data["detection"]["iou_threshold"]), 0.01)
-    warmup_secs = st.number_input("Warm-up seconds", min_value=0, max_value=30, value=3, step=1)
+    warmup_secs = st.number_input("Warm-up seconds", min_value=0, max_value=30, value=5, step=1)
 
     st.header("Trajectory prediction")
-    horizon_frames = st.slider("Prediction horizon N (frames)", 3, 60, 10, 1)
+    horizon_frames = st.slider("Prediction horizon N (frames)", 3, 60, 6, 1)
 
     st.header("Evidence")
-    prebuffer_secs = st.number_input("Pre-buffer seconds", min_value=1, max_value=30, value=5, step=1)
+    prebuffer_secs = st.number_input("Pre-buffer seconds", min_value=1, max_value=30, value=3, step=1)
     postbuffer_secs = st.number_input("Post-buffer seconds", min_value=1, max_value=30, value=5, step=1)
 
     st.header("VLM classification (fast + stable)")
