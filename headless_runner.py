@@ -223,16 +223,16 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Target processing FPS (file_live pacing).")
     perf.add_argument("--infer-width", type=int, default=640,
                       help="Resolution sent to GroundingDINO (separate from display).")
-    perf.add_argument("--dino-every", type=int, default=15,
+    perf.add_argument("--dino-every", type=int, default=1,
                       help="Run GroundingDINO once every N frames; Kalman in between.")
     perf.add_argument("--crop-pad", type=float, default=0.20,
                       help="Padding factor around runway bounding-rect for inference crop.")
 
     gating = p.add_argument_group("Incident gating")
-    gating.add_argument("--confirm-n", type=int, default=25,
-                        help="Frames track must be in-runway to open incident.")
-    gating.add_argument("--window-m", type=int, default=42,
-                        help="Sliding window size for N-of-M gating.")
+    gating.add_argument("--confirm-n", type=int, default=3,
+                        help="DINO-confirmed frames track must be in-runway to open incident.")
+    gating.add_argument("--window-m", type=int, default=5,
+                        help="Sliding window size for N-of-M gating (DINO frames only).")
     gating.add_argument("--warmup-secs", type=float, default=5.0,
                         help="Background warmup seconds before detection starts.")
 

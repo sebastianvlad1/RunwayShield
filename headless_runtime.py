@@ -86,8 +86,8 @@ class RuntimeConfig:
     warmup_secs: float = 5.0
 
     # --- Incident gating ---
-    confirm_n: int = 25
-    window_m: int = 42
+    confirm_n: int = 3
+    window_m: int = 5
 
     # --- Detection (GroundingDINO) ---
     yolo_model: str = "IDEA-Research/grounding-dino-tiny"
@@ -104,8 +104,11 @@ class RuntimeConfig:
     infer_width: int = 640
     """Resolution sent to GroundingDINO (separate from display proc_width)."""
 
-    dino_every: int = 15
+    dino_every: int = 1
     """Run GroundingDINO once every N processed frames; Kalman-predict in between."""
+
+    track_expiry_frames: int = 30
+    """Clear tracked objects after this many consecutive Kalman-only frames (anti-ghost)."""
 
     crop_pad_factor: float = 0.20
     """Padding around runway bounding-rect before cropping for inference (fraction)."""
@@ -175,9 +178,8 @@ class _VideoSource:
         self._src_fps: float = src_fps
         self._frame_skip: int = max(1, int(round(src_fps / float(cfg.proc_fps))))
 
-        # Pacing for file_live mode
-        if cfg.source_mode == "file_live":
-            self._pace_period = 1.0 / float(cfg.proc_fps)
+        # Pacing — throttle all modes to proc_fps to avoid flooding the UI
+        self._pace_period = 1.0 / float(cfg.proc_fps)
 
     # -- public interface --
 
@@ -220,8 +222,8 @@ class _VideoSource:
             if (self._frame_idx - 1) % self._frame_skip != 0:
                 continue
 
-            # Pacing for file_live
-            if self._cfg.source_mode == "file_live" and self._pace_period > 0:
+            # Pacing — all modes
+            if self._pace_period > 0:
                 now = time.monotonic()
                 if self._last_pace_t > 0:
                     wait = self._pace_period - (now - self._last_pace_t)
@@ -506,6 +508,7 @@ class RunwayShieldRuntime:
         self._last_tracked_objects: List[TrackedObject] = []
         self._dino_in_flight: bool = False
         self._last_dino_submit: int = 0
+        self._frames_since_dino: int = 0  # anti-ghost expiry counter
 
         effective_fps = cfg.proc_fps
 
@@ -732,6 +735,7 @@ class RunwayShieldRuntime:
         self._rec.push_frame(frame)
         is_warmup = self._processed < self._warmup_frames
         cfg = self._cfg
+        dino_fresh = False  # set True only when DINO result arrives
 
         if is_warmup:
             # --- Branch C: warmup — no detection ---
@@ -747,6 +751,8 @@ class RunwayShieldRuntime:
                 dino_objects = self._run_dino_sync(frame)
                 self._traj.inject_dino_observations(dino_objects)
                 self._last_tracked_objects = dino_objects
+                self._frames_since_dino = 0
+                dino_fresh = True
             else:
                 # Poll for completed async DINO result.
                 dino_result = self._async_dino.poll()
@@ -756,6 +762,14 @@ class RunwayShieldRuntime:
                     self._traj.inject_dino_observations(dino_result)
                     self._last_tracked_objects = dino_result
                     self._dino_in_flight = False
+                    self._frames_since_dino = 0
+                    dino_fresh = True
+                else:
+                    self._frames_since_dino += 1
+
+                # Track expiry: if no DINO result for too long, clear ghosts.
+                if self._frames_since_dino >= cfg.track_expiry_frames:
+                    self._last_tracked_objects = []
 
                 # Submit new DINO job if eligible.
                 _dino_every = max(1, cfg.dino_every)
@@ -770,32 +784,34 @@ class RunwayShieldRuntime:
                 self._last_tracked_objects
             )
 
+        # --- Incident gating: only count DINO-confirmed frames ---
         seen_tids: List[int] = []
-        for obj in tracked_objects:
-            x1, y1, x2, y2 = clamp_bbox(obj.bbox_xyxy, self._frame_w, self._frame_h)
-            cx, cy = bbox_center((x1, y1, x2, y2))
-            in_runway_now = point_in_polygon(self._poly, cx, cy)
+        if not is_warmup and dino_fresh:
+            for obj in tracked_objects:
+                x1, y1, x2, y2 = clamp_bbox(obj.bbox_xyxy, self._frame_w, self._frame_h)
+                cx, cy = bbox_center((x1, y1, x2, y2))
+                in_runway_now = point_in_polygon(self._poly, cx, cy)
 
-            pred = trajectory_map.get(int(obj.track_id))
-            future_points = pred.future_points if pred is not None else []
-            will_enter_runway = any(point_in_polygon(self._poly, px, py) for px, py in future_points)
+                pred = trajectory_map.get(int(obj.track_id))
+                future_points = pred.future_points if pred is not None else []
+                will_enter_runway = any(point_in_polygon(self._poly, px, py) for px, py in future_points)
 
-            if not in_runway_now and not will_enter_runway:
-                continue
+                if not in_runway_now and not will_enter_runway:
+                    continue
 
-            seen_tids.append(int(obj.track_id))
-            self._engine.on_detection(
-                track_id=int(obj.track_id),
-                in_runway=bool(in_runway_now or will_enter_runway),
-                bbox_xyxy=(x1, y1, x2, y2),
-                conf=float(obj.confidence),
-                detector_label=str(obj.class_name),
-                predicted_intrusion=bool(will_enter_runway and not in_runway_now),
-                predicted_points=future_points,
-                trajectory_horizon=int(self._cfg.horizon_frames),
-            )
+                seen_tids.append(int(obj.track_id))
+                self._engine.on_detection(
+                    track_id=int(obj.track_id),
+                    in_runway=bool(in_runway_now or will_enter_runway),
+                    bbox_xyxy=(x1, y1, x2, y2),
+                    conf=float(obj.confidence),
+                    detector_label=str(obj.class_name),
+                    predicted_intrusion=bool(will_enter_runway and not in_runway_now),
+                    predicted_points=future_points,
+                    trajectory_horizon=int(self._cfg.horizon_frames),
+                )
 
-        self._engine.update_tracks(seen_tids)
+            self._engine.update_tracks(seen_tids)
 
         new_incidents: List[Incident] = []
         if not is_warmup:

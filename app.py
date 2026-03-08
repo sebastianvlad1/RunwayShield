@@ -151,8 +151,8 @@ with st.sidebar:
     proc_fps = st.select_slider("Process FPS (approx)", options=[5, 7, 10, 15, 20, 30], value=30)
 
     st.header("Incident gating")
-    window_m = st.number_input("Window M (frames)", min_value=5, max_value=120, value=42, step=1)
-    confirm_n = st.number_input("Confirm N (in-runway frames)", min_value=2, max_value=120, value=25, step=1)
+    window_m = st.number_input("Window M (DINO frames)", min_value=3, max_value=60, value=5, step=1)
+    confirm_n = st.number_input("Confirm N (DINO in-runway frames)", min_value=2, max_value=60, value=3, step=1)
 
     st.header("GroundingDINO detection")
     yolo_device = st.selectbox("Detection device", ["auto", "cpu", "cuda", "mps"], index=0)

@@ -9,3 +9,6 @@ detection:
     - id: 1
       ro: "avion"
       en: "airplane"
+    - id: 2
+      ro: "persoana care poarta o vesta reflectorizanta"
+      en: "person wearing a reflective vest"
