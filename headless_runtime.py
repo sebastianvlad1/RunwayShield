@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,14 +80,14 @@ class RuntimeConfig:
 
     # --- Frame sizing/rate ---
     proc_width: int = 640
-    proc_fps: int = 7
+    proc_fps: int = 30
 
     # --- Warmup ---
     warmup_secs: float = 5.0
 
     # --- Incident gating ---
-    confirm_n: int = 6
-    window_m: int = 10
+    confirm_n: int = 25
+    window_m: int = 42
 
     # --- Detection (GroundingDINO) ---
     yolo_model: str = "IDEA-Research/grounding-dino-tiny"
@@ -102,7 +104,7 @@ class RuntimeConfig:
     infer_width: int = 640
     """Resolution sent to GroundingDINO (separate from display proc_width)."""
 
-    dino_every: int = 3
+    dino_every: int = 15
     """Run GroundingDINO once every N processed frames; Kalman-predict in between."""
 
     crop_pad_factor: float = 0.20
@@ -303,6 +305,125 @@ class _VideoSource:
 
 
 # ---------------------------------------------------------------------------
+# Async DINO inference worker
+# ---------------------------------------------------------------------------
+
+class _AsyncDINOInference:
+    """Runs GroundingDINO inference on a daemon thread.
+
+    The main thread calls :meth:`submit` with a frame (non-blocking) and
+    :meth:`poll` to check for results (non-blocking).  The worker thread
+    performs crop → resize → ``infer_and_track`` → coordinate translation
+    and puts the result in an output queue.
+    """
+
+    def __init__(
+        self,
+        pipeline: GroundingDINOPipeline,
+        crop_rect: Tuple[int, int, int, int],
+        infer_width: int,
+        frame_w: int,
+        frame_h: int,
+    ) -> None:
+        self._pipeline = pipeline
+        self._crop_rect = crop_rect
+        self._infer_width = infer_width
+        self._frame_w = frame_w
+        self._frame_h = frame_h
+        self._input_q: queue.Queue = queue.Queue(maxsize=1)
+        self._output_q: queue.Queue = queue.Queue(maxsize=1)
+        self._thread = threading.Thread(target=self._worker, daemon=True, name="dino-async")
+        self._thread.start()
+
+    # -- public interface --
+
+    def submit(self, frame: np.ndarray) -> None:
+        """Submit a frame for DINO inference (non-blocking, drops stale)."""
+        # Discard any stale frame that hasn't been picked up yet.
+        try:
+            self._input_q.get_nowait()
+        except queue.Empty:
+            pass
+        self._input_q.put(frame)
+
+    def poll(self) -> Optional[List[TrackedObject]]:
+        """Return DINO result if ready, else *None* (non-blocking)."""
+        try:
+            return self._output_q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def shutdown(self) -> None:
+        """Stop the worker thread (idempotent)."""
+        if not self._thread.is_alive():
+            return
+        try:
+            self._input_q.get_nowait()
+        except queue.Empty:
+            pass
+        self._input_q.put(None)  # poison pill
+        self._thread.join(timeout=10.0)
+
+    # -- background worker --
+
+    def _worker(self) -> None:
+        """Loop: receive frame → crop/resize → DINO → translate → output."""
+        while True:
+            frame = self._input_q.get()
+            if frame is None:
+                break
+            try:
+                rx1, ry1, rx2, ry2 = self._crop_rect
+                crop_w = rx2 - rx1
+                crop_h = ry2 - ry1
+
+                if crop_w >= 64 and crop_h >= 64:
+                    crop = frame[ry1:ry2, rx1:rx2]
+                    scale = min(1.0, self._infer_width / float(crop_w))
+                    if scale < 1.0:
+                        infer_h = int(round(crop_h * scale))
+                        infer_w = int(round(crop_w * scale))
+                        small = cv2.resize(crop, (infer_w, infer_h),
+                                           interpolation=cv2.INTER_AREA)
+                    else:
+                        small = crop
+                        scale = 1.0
+
+                    raw_tracked = self._pipeline.infer_and_track(small)
+
+                    # Translate coordinates back to full-frame space.
+                    tracked_objects: List[TrackedObject] = []
+                    for obj in raw_tracked:
+                        ox1, oy1, ox2, oy2 = obj.bbox_xyxy
+                        ox1 = int(round(ox1 / scale)) + rx1
+                        oy1 = int(round(oy1 / scale)) + ry1
+                        ox2 = int(round(ox2 / scale)) + rx1
+                        oy2 = int(round(oy2 / scale)) + ry1
+                        cx = (ox1 + ox2) / 2.0
+                        cy = (oy1 + oy2) / 2.0
+                        tracked_objects.append(TrackedObject(
+                            track_id=obj.track_id,
+                            bbox_xyxy=(ox1, oy1, ox2, oy2),
+                            confidence=obj.confidence,
+                            class_name=obj.class_name,
+                            class_id=obj.class_id,
+                            centroid_xy=(cx, cy),
+                        ))
+                else:
+                    # Crop too small — fall back to full frame inference.
+                    tracked_objects = self._pipeline.infer_and_track(frame)
+
+                # Put result (discard old if full).
+                try:
+                    self._output_q.get_nowait()
+                except queue.Empty:
+                    pass
+                self._output_q.put(tracked_objects)
+            except Exception as exc:
+                logger.warning("DINO async worker error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main runtime class
 # ---------------------------------------------------------------------------
 
@@ -383,6 +504,8 @@ class RunwayShieldRuntime:
 
         # State for dino_every skip-frame logic
         self._last_tracked_objects: List[TrackedObject] = []
+        self._dino_in_flight: bool = False
+        self._last_dino_submit: int = 0
 
         effective_fps = cfg.proc_fps
 
@@ -395,6 +518,15 @@ class RunwayShieldRuntime:
                 device=cfg.yolo_device,
                 classes_en=cfg.yolo_classes_en,
             )
+        )
+
+        # Async DINO inference worker (daemon thread) — must be after self._yolo
+        self._async_dino = _AsyncDINOInference(
+            pipeline=self._yolo,
+            crop_rect=self._runway_crop_rect,
+            infer_width=cfg.infer_width,
+            frame_w=self._frame_w,
+            frame_h=self._frame_h,
         )
 
         # Trajectory predictor
@@ -537,7 +669,58 @@ class RunwayShieldRuntime:
     def shutdown(self) -> None:
         """Release all resources. Safe to call multiple times."""
         self.stop()
+        if hasattr(self, '_async_dino'):
+            self._async_dino.shutdown()
         self._video.stop()
+
+    # -- internal helpers --
+
+    def _run_dino_sync(self, frame: np.ndarray) -> List[TrackedObject]:
+        """Run one synchronous DINO inference (first post-warmup frame only).
+
+        Performs the same crop → resize → infer → translate pipeline as the
+        async worker but blocks on the calling thread so that initial tracks
+        are available immediately.
+        """
+        rx1, ry1, rx2, ry2 = self._runway_crop_rect
+        crop_w = rx2 - rx1
+        crop_h = ry2 - ry1
+        cfg = self._cfg
+
+        if crop_w >= 64 and crop_h >= 64:
+            crop = frame[ry1:ry2, rx1:rx2]
+            scale = min(1.0, cfg.infer_width / float(crop_w))
+            if scale < 1.0:
+                infer_h = int(round(crop_h * scale))
+                infer_w = int(round(crop_w * scale))
+                small = cv2.resize(crop, (infer_w, infer_h),
+                                   interpolation=cv2.INTER_AREA)
+            else:
+                small = crop
+                scale = 1.0
+
+            raw_tracked = self._yolo.infer_and_track(small)
+
+            tracked_objects: List[TrackedObject] = []
+            for obj in raw_tracked:
+                ox1, oy1, ox2, oy2 = obj.bbox_xyxy
+                ox1 = int(round(ox1 / scale)) + rx1
+                oy1 = int(round(oy1 / scale)) + ry1
+                ox2 = int(round(ox2 / scale)) + rx1
+                oy2 = int(round(oy2 / scale)) + ry1
+                cx = (ox1 + ox2) / 2.0
+                cy = (oy1 + oy2) / 2.0
+                tracked_objects.append(TrackedObject(
+                    track_id=obj.track_id,
+                    bbox_xyxy=(ox1, oy1, ox2, oy2),
+                    confidence=obj.confidence,
+                    class_name=obj.class_name,
+                    class_id=obj.class_id,
+                    centroid_xy=(cx, cy),
+                ))
+            return tracked_objects
+        else:
+            return self._yolo.infer_and_track(frame)
 
     # -- internal frame processor --
 
@@ -555,54 +738,34 @@ class RunwayShieldRuntime:
             tracked_objects: List[TrackedObject] = []
             trajectory_map: dict = {}
 
-        elif self._processed == self._warmup_frames or self._processed % cfg.dino_every == 0:
-            # --- Branch A: GroundingDINO inference frame ---
-            # Crop to padded runway bounding rect + optional downscale.
-            rx1, ry1, rx2, ry2 = self._runway_crop_rect
-            crop_w = rx2 - rx1
-            crop_h = ry2 - ry1
-
-            if crop_w >= 64 and crop_h >= 64:
-                crop = frame[ry1:ry2, rx1:rx2]
-                # Downscale only — never upscale.
-                scale = min(1.0, cfg.infer_width / float(crop_w))
-                if scale < 1.0:
-                    infer_h = int(round(crop_h * scale))
-                    infer_w = int(round(crop_w * scale))
-                    small = cv2.resize(crop, (infer_w, infer_h), interpolation=cv2.INTER_AREA)
-                else:
-                    small = crop
-                    scale = 1.0
-
-                raw_tracked = self._yolo.infer_and_track(small)
-
-                # Translate coordinates back to full-frame space.
-                tracked_objects = []
-                for obj in raw_tracked:
-                    ox1, oy1, ox2, oy2 = obj.bbox_xyxy
-                    ox1 = int(round(ox1 / scale)) + rx1
-                    oy1 = int(round(oy1 / scale)) + ry1
-                    ox2 = int(round(ox2 / scale)) + rx1
-                    oy2 = int(round(oy2 / scale)) + ry1
-                    cx = (ox1 + ox2) / 2.0
-                    cy = (oy1 + oy2) / 2.0
-                    tracked_objects.append(TrackedObject(
-                        track_id=obj.track_id,
-                        bbox_xyxy=(ox1, oy1, ox2, oy2),
-                        confidence=obj.confidence,
-                        class_name=obj.class_name,
-                        class_id=obj.class_id,
-                        centroid_xy=(cx, cy),
-                    ))
-            else:
-                # Crop too small — fall back to full frame inference.
-                tracked_objects = self._yolo.infer_and_track(frame)
-
-            trajectory_map = self._traj.update_and_predict(tracked_objects)
-            self._last_tracked_objects = tracked_objects
-
         else:
-            # --- Branch B: Kalman-only frame (skip GroundingDINO) ---
+            # --- Post-warmup: async DINO + Kalman interpolation ---
+
+            if self._processed == self._warmup_frames:
+                # First post-warmup frame: synchronous DINO to establish
+                # initial Kalman tracks (one-time blocking call).
+                dino_objects = self._run_dino_sync(frame)
+                self._traj.inject_dino_observations(dino_objects)
+                self._last_tracked_objects = dino_objects
+            else:
+                # Poll for completed async DINO result.
+                dino_result = self._async_dino.poll()
+                if dino_result is not None:
+                    # Recalibrate Kalman with DINO observations (measurement
+                    # update only — no extra predict step).
+                    self._traj.inject_dino_observations(dino_result)
+                    self._last_tracked_objects = dino_result
+                    self._dino_in_flight = False
+
+                # Submit new DINO job if eligible.
+                _dino_every = max(1, cfg.dino_every)
+                frames_since = self._processed - self._last_dino_submit
+                if not self._dino_in_flight and frames_since >= _dino_every:
+                    self._async_dino.submit(frame)
+                    self._dino_in_flight = True
+                    self._last_dino_submit = self._processed
+
+            # Advance Kalman one step — every post-warmup frame, uniformly.
             tracked_objects, trajectory_map = self._traj.predict_only_step(
                 self._last_tracked_objects
             )
@@ -713,6 +876,8 @@ class RunwayShieldRuntime:
         self._save_jsonl({"event": "RUN_END", "ts": time.time(),
                           "processed_frames": self._processed,
                           "incidents": len(self._engine.incidents)})
+        if hasattr(self, '_async_dino'):
+            self._async_dino.shutdown()
         self._video.stop()
         logger.info(f"[runtime] finished — {self._processed} frames processed, "
                     f"{len(self._engine.incidents)} incidents total")

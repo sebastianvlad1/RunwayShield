@@ -4,8 +4,8 @@ detection:
   iou_threshold: 0.60
   classes:
     - id: 0
-      ro: "persoana purtand ochelari"
-      en: "person wearing glasses"
+      ro: "persoana cu ochelari"
+      en: "person wearing eyeglasses"
     - id: 1
       ro: "avion"
       en: "airplane"

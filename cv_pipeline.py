@@ -456,6 +456,65 @@ class TrajectoryPredictor:
             state_xyvxvy=(float(sx[0, 0]), float(sx[1, 0]), float(sx[2, 0]), float(sx[3, 0])),
         )
 
+    def _measurement_update_only(
+        self, track_id: int, center_xy: Tuple[float, float], bbox_xyxy: Tuple[int, int, int, int]
+    ) -> None:
+        """Kalman measurement update *without* the embedded predict step.
+
+        Used by :meth:`inject_dino_observations` (async DINO path) so that
+        the caller can follow with :meth:`predict_only_step` without
+        advancing the state twice per frame.
+        """
+        z = np.array([[float(center_xy[0])], [float(center_xy[1])]], dtype=np.float32)
+
+        if track_id not in self._state:
+            # First observation — initialise state with zero velocity.
+            x0 = np.array([[z[0, 0]], [z[1, 0]], [0.0], [0.0]], dtype=np.float32)
+            self._state[track_id] = x0
+            self._cov[track_id] = self._P0.copy()
+            self._missed[track_id] = 0
+        else:
+            self._missed[track_id] = 0
+
+        x = self._state[track_id]
+        p = self._cov[track_id]
+
+        # Direct measurement update on current state (no predict step).
+        y = z - (self._H @ x)
+        s = self._H @ p @ self._H.T + self._R
+        k = p @ self._H.T @ np.linalg.inv(s)
+        x_new = x + (k @ y)
+        p_new = (self._I - (k @ self._H)) @ p
+
+        self._state[track_id] = x_new
+        self._cov[track_id] = p_new
+
+        # Update bbox size EMA (same as _update).
+        x1, y1, x2, y2 = bbox_xyxy
+        bw = max(2.0, float(x2 - x1))
+        bh = max(2.0, float(y2 - y1))
+        prev = self._size_wh.get(track_id)
+        if prev is None:
+            self._size_wh[track_id] = (bw, bh)
+        else:
+            self._size_wh[track_id] = (0.8 * prev[0] + 0.2 * bw, 0.8 * prev[1] + 0.2 * bh)
+
+    def inject_dino_observations(self, tracked_objects: List[TrackedObject]) -> None:
+        """Inject DINO detections as measurement-only Kalman corrections.
+
+        Unlike :meth:`update_and_predict`, this does **not** advance the
+        Kalman state by a time step.  The caller is expected to call
+        :meth:`predict_only_step` on every frame (including the frame
+        where DINO results arrive) so the state advances exactly once
+        per frame.
+        """
+        active: set[int] = set()
+        for obj in tracked_objects:
+            tid = int(obj.track_id)
+            active.add(tid)
+            self._measurement_update_only(tid, obj.centroid_xy, obj.bbox_xyxy)
+        self.mark_missed(active_track_ids=active)
+
     def update_and_predict(self, tracked_objects: List[TrackedObject]) -> Dict[int, TrajectoryPrediction]:
         active = set()
         for obj in tracked_objects:

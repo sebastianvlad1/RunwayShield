@@ -192,13 +192,13 @@ python headless_runner.py --help
 | `--verbose` | `False` | Enable DEBUG logging |
 | **Performance** | | |
 | `--proc-width` | `640` | Processing frame width in pixels |
-| `--proc-fps` | `7` | Target processing FPS (also controls `file_live` pacing) |
+| `--proc-fps` | `30` | Target processing FPS (also controls `file_live` pacing) |
 | `--infer-width` | `640` | Resolution sent to GroundingDINO (separate from display) |
-| `--dino-every` | `3` | Run GroundingDINO once every N frames; Kalman-predict in between |
+| `--dino-every` | `15` | Run GroundingDINO once every N frames; Kalman-predict in between |
 | `--crop-pad` | `0.20` | Padding factor around runway bounding-rect for inference crop |
 | **Incident gating** | | |
-| `--confirm-n` | `6` | Frames a track must be in-runway to open an incident |
-| `--window-m` | `10` | Sliding window size for N-of-M gating |
+| `--confirm-n` | `25` | Frames a track must be in-runway to open an incident |
+| `--window-m` | `42` | Sliding window size for N-of-M gating |
 | `--warmup-secs` | `5.0` | Seconds to skip detection at startup (background stabilisation) |
 | **YOLO detection** | | |
 | `--yolo-conf` | `0.35` | YOLO confidence threshold (overrides `config.yaml`) |
